@@ -1,51 +1,61 @@
-# Pi Agent Good For Use
+# Pi Arsenal
 
-Pi extension package for workspace and resource management.
+> **LOADOUT READY.** A terminal control deck for [Pi](https://github.com/earendil-works/pi): organize the workspace, deploy skills, inspect sessions, and review MCP tools without leaving the TUI.
+
+```text
+╔══════════════════════════════════════════════╗
+║                 PI  ARSENAL                  ║
+║     WORKSPACE · SESSIONS · SKILLS · MCP       ║
+╚══════════════════════════════════════════════╝
+```
 
 ## Modules
 
-- **Workspace Drawer** — projects, files, computer browser, usage, Mermaid gallery, Session Library, Skill Library, and MCP Server browser.
-- **Session Library** — inspect sessions, rename, add personal descriptions, reload a session in the current window, and delete non-current sessions.
-- **Skill Library** — browse enabled/disabled skills by folder, set personal display names and notes, enable/disable individual skills or folders, organize folders, and prefill `/skill:<name>` commands.
-- **MCP Server Browser** — read cached MCP server tools without showing secrets.
-- **Task Panel** — fixed task panel extension.
-- **Startup Splash** — red/black terminal startup header.
-- **Tokyo Night Terra** — theme.
+| Module | What it does |
+|---|---|
+| **Workspace Drawer** | Projects, files, computer browser, usage, Mermaid gallery, Session Library, Skill Library, and MCP Server browser. |
+| **Session Library** | Inspect sessions, rename them, add private descriptions, reload in the current window, and delete non-current sessions. |
+| **Skill Library** | Browse enabled/disabled skills by folder; add private labels; enable/disable skills or folders; organize folders; prepare `/skill:<name>` commands. |
+| **MCP Server Browser** | Read cached MCP servers and tools without displaying secrets. |
+| **Task Panel** | Persistent task panel extension. |
+| **Startup Splash** | Red/black terminal startup header. |
+| **Tokyo Night Terra** | Included Pi theme. |
 
-## Use
-
-Install from GitHub:
+## Deploy
 
 ```bash
-pi install git:github.com/SeiyunSky/Pi-agent-Good-For-Use
+pi install git:github.com/SeiyunSky/Pi-Arsenal
 ```
 
-Reload Pi after installation:
+Then reload Pi:
 
 ```text
 /reload
 ```
 
-Open the Workspace Drawer:
+## Commands
+
+| Command | Action |
+|---|---|
+| `Alt+W` | Open the Workspace Drawer |
+| `/workspace` | Open the Workspace Drawer when the terminal does not deliver `Alt+W` |
+| `/sessions` | Open Session Library directly |
+| `/reload` | Apply changed skill discovery after enable/disable operations |
+
+## Skill Loadout
+
+Open the drawer, then:
 
 ```text
-Alt+W
+Skill Library → Enabled skills / Disabled skills → folder → skill
 ```
 
-or:
+For enabled skills, select **Use this skill now**. Pi Arsenal prepares the canonical command in the editor:
 
 ```text
-/workspace
+/skill:<canonical-name>
 ```
 
-Open Session Library directly:
+Add task details and submit when ready.
 
-```text
-/sessions
-```
-
-Skill enable/disable changes are applied after:
-
-```text
-/reload
-```
+> Skill enable/disable moves complete skill folders between `~/.agents/skills` and `~/.agents/disabled-skills`. Nothing is deleted. Run `/reload` afterward.

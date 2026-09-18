@@ -1,7 +1,7 @@
 {
-  "name": "pi-agent-good-for-use",
+  "name": "pi-arsenal",
   "version": "0.1.0",
-  "description": "Workspace, session, skill, MCP, task, theme, and splash extensions for Pi.",
+  "description": "A terminal control deck for Pi: workspaces, sessions, skills, MCP, tasks, theme, and splash.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -31,6 +31,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SeiyunSky/Pi-agent-Good-For-Use.git"
+    "url": "git+https://github.com/SeiyunSky/Pi-Arsenal.git"
   }
 }

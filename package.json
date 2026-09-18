@@ -1,0 +1,36 @@
+{
+  "name": "pi-agent-good-for-use",
+  "version": "0.1.0",
+  "description": "Workspace, session, skill, MCP, task, theme, and splash extensions for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "tui",
+    "workspace",
+    "skills",
+    "sessions"
+  ],
+  "files": [
+    "extensions",
+    "lib",
+    "themes",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "themes": ["./themes"]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SeiyunSky/Pi-agent-Good-For-Use.git"
+  }
+}

@@ -1,5 +1,9 @@
 # Pi Arsenal
 
+<p align="center">
+  <img src="assets/pi-arsenal-banner.png" alt="Pi Arsenal red signal artwork" width="420">
+</p>
+
 > **LOADOUT READY.** A terminal control deck for [Pi](https://github.com/earendil-works/pi): organize the workspace, deploy skills, inspect sessions, and review MCP tools without leaving the TUI.
 
 ```text

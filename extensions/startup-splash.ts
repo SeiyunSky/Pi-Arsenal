@@ -1,44 +1,56 @@
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+const PORTRAIT = [
+	"                         .::---::::...",
+	"                    .:--=++==-------::::::.         .",
+	"               .:-=++*+++++==--:-----:::::::...",
+	"          ..:-=+++++++====--::::-::---:::::::...",
+	"        .-=++++++==--::::::::::-----:::::::...",
+	"      .-+++++==-::::::--::---:::::---::::...",
+	"     :=+++=-:::::--=================--:::...",
+	"    :+++=-::::-===+++++++====++++++==--::...",
+	"   .+++=::::-==+++++++==---==+++++++=-::...",
+	"   -++=::::=++++++==--::::--==++++++=-:...",
+	"  :++=::::=++++==-::::::--::::-+++++=-:...",
+	"  =++-:::=+++=-:::::::=+++=::::=+++=-:...",
+	" .+++-::=+++-:::::::-=+++++-:::=++=-:....",
+	" .++=::-+++-:::::::--=+++++=-::-++=:....",
+	"  ++=::=++=:::::::--=++++++=::=++-:....",
+	"  =++-:=++=::::::--=++++++=-:-++=:....",
+	"  :++=-+++-:::::--=++++++=-:-++=:....",
+	"   =++=+++-::::--=++++++=-:=++-:....",
+	"   :++++++-:::--=++++++=-:=++=:....",
+	"    -+++++-::--=++++++=-:=++-:....",
+	"     =++++=--=++++++=-:=++=:....",
+	"      -+++++++=++++=-:=++-:....",
+	"       :++++++=++=-:=++=:....",
+	"        .-++++++=-:=++-:....",
+	"          .-+++=-:=++=:....",
+	"             .:::=++-:....",
+	"                .-+=:....",
+	"                 .:....",
+];
+
+function paint(line: string, theme: Theme): string {
+	let result = "", buffer = "", mode = "";
+	const colorOf = (char: string) => char === " " ? "" : char === "." || char === ":" ? "dim" : char === "*" || char === "+" ? "text" : "error";
+	const flush = () => { if (buffer) result += mode ? theme.fg(mode as "dim" | "text" | "error", buffer) : buffer; buffer = ""; };
+	for (const char of line) { const next = colorOf(char); if (next !== mode) { flush(); mode = next; } buffer += char; }
+	flush(); return result;
+}
+
 function splash(theme: Theme, width: number): string[] {
-	const red = (text: string) => theme.fg("error", text);
-	const hot = (text: string) => theme.bold(theme.fg("error", text));
-	const shade = (text: string) => theme.fg("dim", text);
-	const ink = (text: string) => theme.fg("border", text);
-	const light = (text: string) => theme.fg("text", text);
-	const art = [
-		`${shade("╲")}       ${red("╱")}  ${shade("·")}       ${red("╲")}`,
-		`${shade("  ╲")}   ${red("╱╲╲")}     ${hot("╱╲")}    ${shade("╱")}`,
-		`     ${red("╱████╲")} ${hot("╱█████╲")}  ${red("╲")}`,
-		`    ${red("╱██╲████████████╲")} ${shade("╲")}`,
-		`   ${red("╱███╲██████████╲███╲")}`,
-		`  ${red("╱██████████████╲████╲")}`,
-		` ${red("╱██╲████")} ${ink("╲")} ${red("███████╲")} ${shade("╲████╲")}`,
-		` ${red("╲███╲")} ${light("◢")} ${ink("▔▔")} ${light("◣")} ${red("╲█████╲")} ${shade("╲███╲")}`,
-		`  ${red("╲███╲")} ${light("◥")} ${ink("▁▁")} ${red("╲██████╲")} ${shade("╲███│")}`,
-		`   ${red("╲████╲")} ${ink("╲____")} ${red("╲██████╲")} ${shade("│██│")}`,
-		`    ${red("╲█████╲____╲██████╲")} ${shade("│██│")}`,
-		`     ${shade("╲")} ${red("╲██████╲")} ${hot("╲█████╲")} ${shade("╲██│")}`,
-		`      ${shade("╲")} ${red("╲██████╲")} ${hot("╲████╲")} ${shade("╲█│")}`,
-		`       ${red("╲██████╲")} ${shade("╲████╲")}`,
-		`        ${red("╲████╱")} ${shade("╲████╱")}`,
-		`         ${shade("╲╱")}  ${red("╲╱")}  ${shade("╲╱")}`,
-	];
-	const title = `${hot("◆")}${light("  ID: 沫路")} ${shade("// RED SIGNAL")}`;
-	const maxArt = Math.max(...art.map(visibleWidth), visibleWidth(title));
-	if (width < 44) return [truncateToWidth(`${hot("◆")} ${light("ID: 沫路")} ${shade("// RED SIGNAL")}`, width)];
-	const pad = Math.max(0, Math.floor((width - Math.min(maxArt, width)) / 2));
-	const center = (line: string) => " ".repeat(Math.max(0, pad + Math.floor((maxArt - visibleWidth(line)) / 2))) + line;
-	return ["", ...art.map(center), center(title), ""];
+	const label = `${theme.bold(theme.fg("error", "◆"))}${theme.fg("text", "  ID: 沫路")} ${theme.fg("dim", "// PI ARSENAL")}`;
+	if (width < 48) return [truncateToWidth(label, width)];
+	const artWidth = Math.max(...PORTRAIT.map(visibleWidth), visibleWidth(label));
+	const center = (line: string) => " ".repeat(Math.max(0, Math.floor((width - artWidth) / 2) + Math.floor((artWidth - visibleWidth(line)) / 2))) + line;
+	return ["", ...PORTRAIT.map((line) => center(paint(line, theme))), center(label), ""];
 }
 
 export default function startupSplash(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		ctx.ui.setHeader((_tui, theme) => ({
-			invalidate() {},
-			render(width: number): string[] { return splash(theme, width); },
-		}));
+		ctx.ui.setHeader((_tui, theme) => ({ invalidate() {}, render(width: number): string[] { return splash(theme, width); } }));
 	});
 }

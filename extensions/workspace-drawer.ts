@@ -33,7 +33,13 @@ type McpTool = { name: string; description?: string };
 type McpServer = { name: string; tools: McpTool[]; cachedAt?: number };
 type ResourceLabels = { displayName?: string; note?: string };
 type ResourceMetadata = { skills?: Record<string, ResourceLabels>; mcp?: Record<string, ResourceLabels> };
-type Result = { type: "close" } | { type: "workspace"; workspace: Workspace } | { type: "view-diagram"; diagram: Diagram } | { type: "sessions" } | { type: "edit-label"; kind: "skills" | "mcp"; key: string; fallback: string; field: "displayName" | "note" } | { type: "use-skill"; canonicalName: string } | { type: "organize-skills" } | { type: "toggle-skill-folder"; enabled: boolean; relative: string };
+type TranslationStudioBridge = { version: 1; open(ctx: ExtensionCommandContext): Promise<void> };
+type Result = { type: "close" } | { type: "workspace"; workspace: Workspace } | { type: "view-diagram"; diagram: Diagram } | { type: "sessions" | "translation" } | { type: "edit-label"; kind: "skills" | "mcp"; key: string; fallback: string; field: "displayName" | "note" } | { type: "use-skill"; canonicalName: string } | { type: "organize-skills" } | { type: "toggle-skill-folder"; enabled: boolean; relative: string };
+const TRANSLATION_BRIDGE_KEY = Symbol.for("pi-translation-studio.bridge.v1");
+const translationBridge = (): TranslationStudioBridge | undefined => {
+	const bridge = (globalThis as Record<symbol, unknown>)[TRANSLATION_BRIDGE_KEY] as TranslationStudioBridge | undefined;
+	return bridge?.version === 1 ? bridge : undefined;
+};
 
 type MermaidViewer = { server: Server; source: string; title: string; url: string };
 let mermaidViewer: MermaidViewer | undefined;
@@ -256,7 +262,15 @@ class WorkspaceDrawer implements Focusable {
 	private mcpItems: McpServer[] | undefined;
 	private selectedMcp: McpServer | undefined;
 
-	constructor(private readonly ctx: ExtensionCommandContext, private readonly workspace: Workspace, private readonly workspaces: Workspace[], private readonly theme: Theme, private readonly done: (result: Result) => void, private readonly tui: { requestRender(): void }) {}
+	constructor(private readonly ctx: ExtensionCommandContext, private readonly workspace: Workspace, private readonly workspaces: Workspace[], private readonly theme: Theme, private readonly done: (result: Result) => void, private readonly tui: { requestRender(): void }, private readonly hasTranslationStudio: boolean) {}
+
+	private homeItems(): Array<{ label: string; view?: View; result?: "sessions" | "translation" }> {
+		return [
+			{ label: "📁 Projects", view: "projects" }, { label: "📄 Files", view: "files" }, { label: "🖥️  Browse computer…", view: "browser" }, { label: "💰 Usage & Cost", view: "usage" }, { label: "🗺️  Diagram Gallery", view: "diagrams" }, { label: "🕘 Session Library", result: "sessions" },
+			...(this.hasTranslationStudio ? [{ label: "🌐 Translation Studio", result: "translation" as const }] : []),
+			{ label: "✨ Skill Library", view: "skills" }, { label: "🔌 MCP Servers", view: "mcp" },
+		];
+	}
 
 	private open(view: View): void {
 		this.view = view;
@@ -320,14 +334,15 @@ class WorkspaceDrawer implements Focusable {
 		if (matchesKey(data, "s") && this.view === "browser" && this.browserPath) { this.setCurrentDirectory(); return; }
 		if (matchesKey(data, Key.up) || matchesKey(data, "k")) { this.selected = Math.max(0, this.selected - 1); return; }
 		if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
-			const last = this.view === "projects" ? this.workspaces.length : this.view === "files" ? Math.max(0, (this.files?.length || 1) - 1) : this.view === "browser" ? Math.max(0, this.browserEntries.length - 1) : this.view === "diagrams" ? Math.max(0, (this.diagramItems?.length || 1) - 1) : this.view === "skills" ? 1 : this.view === "skill-list" ? this.skillEntryItems.length + (this.skillDirectory ? 1 : 0) : this.view === "skill-detail" ? (this.selectedSkill?.enabled ? 3 : 2) : this.view === "mcp" ? Math.max(0, (this.mcpItems?.length || 1) - 1) : this.view === "mcp-detail" ? Math.max(0, (this.selectedMcp?.tools.length || 1) - 1) : this.view === "usage" ? 0 : 7;
+			const last = this.view === "projects" ? this.workspaces.length : this.view === "files" ? Math.max(0, (this.files?.length || 1) - 1) : this.view === "browser" ? Math.max(0, this.browserEntries.length - 1) : this.view === "diagrams" ? Math.max(0, (this.diagramItems?.length || 1) - 1) : this.view === "skills" ? 1 : this.view === "skill-list" ? this.skillEntryItems.length + (this.skillDirectory ? 1 : 0) : this.view === "skill-detail" ? (this.selectedSkill?.enabled ? 3 : 2) : this.view === "mcp" ? Math.max(0, (this.mcpItems?.length || 1) - 1) : this.view === "mcp-detail" ? Math.max(0, (this.selectedMcp?.tools.length || 1) - 1) : this.view === "usage" ? 0 : this.homeItems().length - 1;
 			this.selected = Math.min(last, this.selected + 1);
 			return;
 		}
 		if (!matchesKey(data, Key.enter) && !matchesKey(data, Key.right)) return;
 		if (this.view === "home") {
-			if (this.selected === 5) { this.done({ type: "sessions" }); return; }
-			this.open(["projects", "files", "browser", "usage", "diagrams", "sessions", "skills", "mcp"][this.selected] as View);
+			const item = this.homeItems()[this.selected];
+			if (item?.result) this.done({ type: item.result });
+			else if (item?.view) this.open(item.view);
 			return;
 		}
 		if (this.view === "skills") { this.skillEnabled = this.selected === 0; this.skillDirectory = ""; this.open("skill-list"); return; }
@@ -373,7 +388,7 @@ class WorkspaceDrawer implements Focusable {
 			lines.push(row(` ${th.fg("accent", "◈")} ${th.bold(this.workspace.name)}`));
 			lines.push(row(` ${th.fg("dim", this.workspace.path)}`));
 			lines.push(row(""));
-			for (const [i, label] of ["📁 Projects", "📄 Files", "🖥️  Browse computer…", "💰 Usage & Cost", "🗺️  Diagram Gallery", "🕘 Session Library", "✨ Skill Library", "🔌 MCP Servers"].entries()) lines.push(row(` ${marker(i)} ${th.fg("text", label)}`));
+			for (const [i, item] of this.homeItems().entries()) lines.push(row(` ${marker(i)} ${th.fg("text", item.label)}`));
 			lines.push(row(""));
 			lines.push(row(th.fg("dim", "↑ ↓ select · Enter / → open · Esc / ← close")));
 		} else if (this.view === "projects") {
@@ -460,12 +475,17 @@ export default function workspaceDrawer(pi: ExtensionAPI) {
 	const open = async (ctx: ExtensionCommandContext): Promise<void> => {
 		if (ctx.mode !== "tui") return;
 		const current = active(ctx);
-		const result = await ctx.ui.custom<Result>((tui, theme, _keybindings, done) => new WorkspaceDrawer(ctx, current, configuredWorkspaces(ctx.cwd), theme, done, tui), {
+		const result = await ctx.ui.custom<Result>((tui, theme, _keybindings, done) => new WorkspaceDrawer(ctx, current, configuredWorkspaces(ctx.cwd), theme, done, tui, Boolean(translationBridge())), {
 			overlay: true,
 			overlayOptions: { anchor: "right-center", width: 54, maxHeight: "100%", margin: { top: 1, right: 1, bottom: 1 } },
 		});
 		if (result?.type === "workspace") { workspace = result.workspace; pi.appendEntry(STATE_TYPE, workspace); ctx.ui.notify(`Workspace: ${workspace.name}`, "info"); }
 		else if (result?.type === "sessions") await openSessionLibrary(pi, ctx);
+		else if (result?.type === "translation") {
+			const bridge = translationBridge();
+			if (bridge) await bridge.open(ctx);
+			else ctx.ui.notify("Install pi-translation-studio to enable Translation Studio.", "info");
+		}
 		else if (result?.type === "organize-skills") { await organizeSkillFolders(ctx); await open(ctx); }
 		else if (result?.type === "use-skill") { ctx.ui.setEditorText(`/skill:${result.canonicalName} `); ctx.ui.notify("Skill command is ready in the editor. Add details, then submit.", "info"); }
 		else if (result?.type === "toggle-skill-folder") {

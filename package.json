@@ -1,6 +1,6 @@
 {
   "name": "pi-arsenal",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "A terminal control deck for Pi: workspaces, sessions, skills, MCP, tasks, theme, and splash.",
   "type": "module",
   "license": "MIT",

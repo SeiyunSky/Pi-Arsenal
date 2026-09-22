@@ -17,18 +17,19 @@
 
 | Module | What it does |
 |---|---|
-| **Workspace Drawer** | Projects, files, computer browser, usage, Mermaid gallery, Session Library, Skill Library, and MCP Server browser. |
+| **Workspace Drawer** | Projects, files, computer browser, usage, Mermaid gallery, Session Library, optional Translation Studio, Skill Library, and MCP Server browser. |
 | **Session Library** | Inspect sessions, rename them, add private descriptions, reload in the current window, and delete non-current sessions. |
 | **Skill Library** | Browse enabled/disabled skills by folder; add private labels; enable/disable skills or folders; organize folders; prepare `/skill:<name>` commands. |
 | **MCP Server Browser** | Read cached MCP servers and tools without displaying secrets. |
 | **Task Panel** | Persistent task panel extension. |
 | **Startup Splash** | Red/black terminal startup header. |
 | **Tokyo Night Terra** | Included Pi theme. |
+| **Translation Studio integration** | Shows `🌐 Translation Studio` when [`pi-translation-studio`](https://www.npmjs.com/package/pi-translation-studio) is installed; Pi Arsenal does not bundle translation logic. |
 
 ## Deploy
 
 ```bash
-pi install git:github.com/SeiyunSky/Pi-Arsenal
+pi install npm:pi-arsenal
 ```
 
 Then reload Pi:
@@ -44,6 +45,7 @@ Then reload Pi:
 | `Alt+W` | Open the Workspace Drawer |
 | `/workspace` | Open the Workspace Drawer when the terminal does not deliver `Alt+W` |
 | `/sessions` | Open Session Library directly |
+| `/translate` | Provided by the optional `pi-translation-studio` package |
 | `/reload` | Apply changed skill discovery after enable/disable operations |
 
 ## Skill Loadout

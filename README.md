@@ -32,7 +32,7 @@
 pi install npm:pi-arsenal
 ```
 
-Pi Arsenal includes [`pi-choices`](https://www.npmjs.com/package/pi-choices) as a runtime dependency. It supplies the explicit confirmation form used when an agent requests cancellation or replacement of an unfinished Task Panel plan; **do not install `pi-choices` separately** when using the npm or Git version of Pi Arsenal.
+Pi Arsenal automatically installs [`pi-choices`](https://www.npmjs.com/package/pi-choices) as a runtime dependency. It supplies the explicit confirmation form used when an agent requests cancellation or replacement of an unfinished Task Panel plan; **do not install `pi-choices` separately** when using the npm or Git version of Pi Arsenal.
 
 Then reload Pi:
 

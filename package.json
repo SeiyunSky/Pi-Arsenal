@@ -9,7 +9,6 @@
   "dependencies": {
     "pi-choices": "^0.1.4"
   },
-  "bundledDependencies": ["pi-choices"],
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",

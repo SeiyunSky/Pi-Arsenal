@@ -1,32 +1,22 @@
 {
   "name": "pi-arsenal",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A terminal control deck for Pi: workspaces, sessions, skills, MCP, tasks, theme, and splash.",
   "type": "module",
   "license": "MIT",
-  "keywords": [
-    "pi-package",
-    "pi",
-    "pi-coding-agent",
-    "tui",
-    "workspace",
-    "skills",
-    "sessions"
-  ],
-  "files": [
-    "extensions",
-    "lib",
-    "themes",
-    "README.md",
-    "LICENSE"
-  ],
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "extension", "theme", "tui", "workspace", "sessions"],
+  "files": ["extensions", "lib", "themes", "README.md", "LICENSE"],
+  "dependencies": {
+    "pi-choices": "^0.1.4"
+  },
+  "bundledDependencies": ["pi-choices"],
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
   "pi": {
-    "extensions": ["./extensions"],
+    "extensions": ["./extensions", "./node_modules/pi-choices/extensions"],
     "themes": ["./themes"]
   },
   "repository": {

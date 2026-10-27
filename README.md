@@ -18,7 +18,7 @@
 | Module | What it does |
 |---|---|
 | **Workspace Drawer** | Projects, files, computer browser, usage, Mermaid gallery, Session Library, optional Translation Studio, Skill Library, and MCP Server browser. |
-| **Session Library** | Inspect sessions, rename them, add private descriptions, reload in the current window, and delete non-current sessions. |
+| **Session Library** | Start a fresh session in the current window; inspect sessions, rename them, add private descriptions, reload in the current window, and delete non-current sessions. |
 | **Skill Library** | Browse enabled/disabled skills by folder; add private labels; enable/disable skills or folders; organize folders; prepare `/skill:<name>` commands. |
 | **MCP Server Browser** | Read cached MCP servers and tools without displaying secrets. |
 | **Task Panel** | Shows the active plan, enforces one-step-at-a-time status progression, and prevents an unfinished plan from being replaced without explicit user approval. |

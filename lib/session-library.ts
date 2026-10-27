@@ -93,13 +93,19 @@ function detailTitle(session: SessionInfo, current: boolean, description: string
 
 export async function openSessionLibrary(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	if (ctx.mode !== "tui") return;
+	const createNew = "＋ New session";
 	while (true) {
 		const currentPath = ctx.sessionManager.getSessionFile();
 		const available = await listSessions();
-		if (!available.length) { ctx.ui.notify("No persisted Pi sessions found.", "info"); return; }
 		const options = available.map((session) => `${sessionTitle(session)} — ${relativeTime(session.modified)} · ${session.messageCount} messages${session.path === currentPath ? "  ● current" : ""}`);
-		const choice = await ctx.ui.select("Session Library", [...options, "Cancel"]);
+		const choice = await ctx.ui.select("Session Library", [createNew, ...options, "Cancel"]);
 		if (!choice || choice === "Cancel") return;
+		if (choice === createNew) {
+			await ctx.waitForIdle();
+			const result = await ctx.newSession({ withSession: async (replacement) => replacement.ui.notify("New session started.", "info") });
+			if (!result.cancelled) return;
+			continue;
+		}
 		const session = available[options.indexOf(choice)];
 		if (!session) continue;
 		if (await manageSession(pi, ctx, session, currentPath) === "switch") return;

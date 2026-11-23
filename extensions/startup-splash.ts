@@ -152,8 +152,10 @@ function splash(theme: Theme, width: number): string[] {
 }
 
 export default function startupSplash(pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, ctx) => {
+	const setHeader = (ctx: { mode: string; ui: { setHeader: (factory: Parameters<typeof ctx.ui.setHeader>[0]) => void } }) => {
 		if (ctx.mode !== "tui") return;
 		ctx.ui.setHeader((_tui, theme) => ({ invalidate() {}, render(width: number): string[] { return splash(theme, width); } }));
-	});
+	};
+	pi.on("session_start", async (_event, ctx) => setHeader(ctx));
+	pi.on("session_tree", async (_event, ctx) => setHeader(ctx));
 }

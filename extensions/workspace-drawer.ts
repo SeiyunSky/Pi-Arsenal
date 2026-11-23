@@ -21,6 +21,8 @@ const HIDDEN_NAMES = new Set([".git", "node_modules", ".venv", "__pycache__"]);
 const LIST_PAGE_SIZE = 16;
 const DIAGRAM_PAGE_SIZE = 8;
 const NOTES_FILENAME = ".pi/workspace-notes.md";
+const NOTES_CTX_FILE = join(ROOT, ".pi", "agent", "workspace-notes-context.json");
+const APPROVAL_LOG_FILE = join(ROOT, ".pi", "agent", "destructive-operation-guard.jsonl");
 const DIAGRAM_STARTER = "Draw a system architecture diagram for this project.";
 
 type Workspace = { name: string; path: string };
@@ -40,12 +42,13 @@ type ResourceLabels = { displayName?: string; note?: string };
 type ResourceMetadata = { skills?: Record<string, ResourceLabels>; mcp?: Record<string, ResourceLabels> };
 type TranslationStudioBridge = { version: 1; open(ctx: ExtensionCommandContext): Promise<void> };
 type EnvItem = { label: string; status: "ok" | "warn" | "info"; detail: string };
+type ApprovalEntry = { timestamp: string; operation: string; tool: string; approval: string; approved: boolean };
 type Result =
 	| { type: "close" }
 	| { type: "workspace"; workspace: Workspace }
 	| { type: "view-diagram"; diagram: Diagram }
 	| { type: "diagram-starter" }
-	| { type: "sessions" | "translation" | "search-sessions" }
+	| { type: "sessions" | "translation" | "search-sessions" | "clean-sessions" | "approval-log" | "toggle-notes-context" }
 	| { type: "edit-label"; kind: "skills" | "mcp"; key: string; fallback: string; field: "displayName" | "note" }
 	| { type: "use-skill"; canonicalName: string }
 	| { type: "organize-skills" }
@@ -132,6 +135,27 @@ function saveWorkspaceNotes(workspacePath: string, text: string): void {
 	const file = join(workspacePath, NOTES_FILENAME);
 	mkdirSync(dirname(file), { recursive: true });
 	writeFileSync(file, text, "utf8");
+}
+
+function notesContextEnabled(workspacePath: string): boolean {
+	try {
+		const data = JSON.parse(readFileSync(NOTES_CTX_FILE, "utf8")) as Record<string, boolean>;
+		return data[workspacePath] === true;
+	} catch { return false; }
+}
+
+function saveNotesContext(workspacePath: string, enabled: boolean): void {
+	let data: Record<string, boolean> = {};
+	try { data = JSON.parse(readFileSync(NOTES_CTX_FILE, "utf8")) as Record<string, boolean>; } catch { /* First write. */ }
+	if (enabled) data[workspacePath] = true; else delete data[workspacePath];
+	mkdirSync(dirname(NOTES_CTX_FILE), { recursive: true });
+	writeFileSync(NOTES_CTX_FILE, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+}
+
+function readApprovalLog(): ApprovalEntry[] {
+	try {
+		return readFileSync(APPROVAL_LOG_FILE, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as ApprovalEntry).reverse();
+	} catch { return []; }
 }
 
 function buildEnvItems(ctx: ExtensionCommandContext, hasTranslation: boolean, hasChoices: boolean): EnvItem[] {
@@ -360,6 +384,7 @@ class WorkspaceDrawer implements Focusable {
 
 	private homeItems(): Array<{ label: string; view?: View; result?: Result["type"] }> {
 		const hasNotes = workspaceNotes(this.workspace.path).trim().length > 0;
+		const notesInCtx = notesContextEnabled(this.workspace.path);
 		return [
 			{ label: "📁 Projects", view: "projects" },
 			{ label: "🖥️  Browse computer…", view: "browser" },
@@ -367,10 +392,13 @@ class WorkspaceDrawer implements Focusable {
 			{ label: "🗺️  Diagram Gallery", view: "diagrams" },
 			{ label: "🕘 Session Library", result: "sessions" },
 			{ label: "🔎 Search sessions…", result: "search-sessions" },
+			{ label: "🧹 Clean up sessions…", result: "clean-sessions" },
 			...(this.hasTranslationStudio ? [{ label: "🌐 Translation Studio", result: "translation" as const }] : []),
 			{ label: `📌 Workspace Notes${hasNotes ? " ·" : ""}`, view: "notes" as View },
+			{ label: `${notesInCtx ? "📌" : "○"} Include notes in context`, result: "toggle-notes-context" as Result["type"] },
 			{ label: "✨ Skill Library", view: "skills" },
 			{ label: "🔌 MCP Servers", view: "mcp" },
+			{ label: "🛡 Approval Log", result: "approval-log" as Result["type"] },
 			{ label: "🔍 Environment Check", view: "env-check" as View },
 		];
 	}
@@ -502,7 +530,8 @@ class WorkspaceDrawer implements Focusable {
 
 		if (this.view === "home") {
 			const hasNotes = workspaceNotes(this.workspace.path).trim().length > 0;
-			lines.push(row(` ${th.fg("accent", "◈")} ${th.bold(this.workspace.name)}${hasNotes ? ` ${th.fg("warning", "📌")}` : ""}`));
+			const notesInCtx = notesContextEnabled(this.workspace.path);
+			lines.push(row(` ${th.fg("accent", "◈")} ${th.bold(this.workspace.name)}${hasNotes ? ` ${th.fg("warning", "📌")}` : ""}${notesInCtx ? ` ${th.fg("success", "→ctx")}` : ""}`));
 			lines.push(row(` ${th.fg("dim", this.workspace.path)}`));
 			lines.push(row(""));
 			for (const [i, item] of this.homeItems().entries()) lines.push(row(` ${marker(i)} ${th.fg("text", item.label)}`));
@@ -712,8 +741,10 @@ export default function workspaceDrawer(pi: ExtensionAPI) {
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
 	pi.on("before_agent_start", async (event, ctx) => {
 		const root = active(ctx);
+		const notes = notesContextEnabled(root.path) ? workspaceNotes(root.path).trim() : "";
+		const notesSection = notes ? `\n\nWorkspace Notes (personal reminders from the user — read-only context, do not modify):\n${notes}` : "";
 		return {
-			systemPrompt: `${event.systemPrompt}\n\nActive Workspace: ${root.path}\nInterpret relative file paths, project files, and project commands as referring to this workspace by default. Use paths under it for native file tools and run project shell commands from it. An explicit user-provided absolute path overrides this default.\n\nDiagram Gallery contract: Do not create or register diagrams unless the user explicitly asks you to generate a diagram, chart, architecture view, flowchart, or node graph. For such a request, create Mermaid flowchart/graph source under <Active Workspace>/.pi/diagrams/<stable-id>.mmd and create or update <Active Workspace>/.pi/diagrams/gallery.json in this exact shape: {"diagrams":[{"id":"stable-id","title":"Human title","file":"stable-id.mmd","type":"mermaid","createdAt":"ISO-8601 timestamp","summary":"short description"}]}. The TUI Gallery only displays manifest entries and previews .mmd Mermaid sources; never infer or auto-register existing files.\n`,
+			systemPrompt: `${event.systemPrompt}\n\nActive Workspace: ${root.path}\nInterpret relative file paths, project files, and project commands as referring to this workspace by default. Use paths under it for native file tools and run project shell commands from it. An explicit user-provided absolute path overrides this default.\n\nDiagram Gallery contract: Do not create or register diagrams unless the user explicitly asks you to generate a diagram, chart, architecture view, flowchart, or node graph. For such a request, create Mermaid flowchart/graph source under <Active Workspace>/.pi/diagrams/<stable-id>.mmd and create or update <Active Workspace>/.pi/diagrams/gallery.json in this exact shape: {"diagrams":[{"id":"stable-id","title":"Human title","file":"stable-id.mmd","type":"mermaid","createdAt":"ISO-8601 timestamp","summary":"short description"}]}. The TUI Gallery only displays manifest entries and previews .mmd Mermaid sources; never infer or auto-register existing files.${notesSection}\n`,
 		};
 	});
 	const open = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -743,6 +774,48 @@ export default function workspaceDrawer(pi: ExtensionAPI) {
 				saveWorkspaceNotes(result.workspacePath, next.trim() ? `${next.trim()}\n` : "");
 				ctx.ui.notify(next.trim() ? "Notes saved." : "Notes cleared.", "info");
 			}
+		}
+		else if (result.type === "clean-sessions") {
+			const currentPath = ctx.sessionManager.getSessionFile();
+			const all = await listSessions();
+			const nonCurrent = all.filter((s) => s.path !== currentPath);
+			if (!nonCurrent.length) { ctx.ui.notify("No other sessions to clean up.", "info"); return; }
+			const strategy = await ctx.ui.select(
+				`Clean up sessions (${nonCurrent.length} available, current is protected)`,
+				["Keep newest 10, delete the rest", "Keep newest 20, delete the rest", "Delete sessions older than 7 days", "Delete sessions older than 30 days", "Cancel"],
+			);
+			if (!strategy || strategy === "Cancel") return;
+			const now = Date.now();
+			const toDelete = strategy.startsWith("Keep newest")
+				? nonCurrent.slice(Number(strategy.includes("10") ? 10 : 20))
+				: nonCurrent.filter((s) => (now - s.modified.getTime()) > (strategy.includes("7") ? 7 : 30) * 86400000);
+			if (!toDelete.length) { ctx.ui.notify("No sessions match the criteria.", "info"); return; }
+			const preview = toDelete.slice(0, 5).map((s) => `• ${sessionTitle(s)} (${relativeTime(s.modified)})`).join("\n");
+			const more = toDelete.length > 5 ? `\n… and ${toDelete.length - 5} more` : "";
+			const confirmed = await ctx.ui.confirm(`Delete ${toDelete.length} session${toDelete.length === 1 ? "" : "s"}?`, `${preview}${more}\n\nThis cannot be undone.`);
+			if (!confirmed) return;
+			let deleted = 0;
+			for (const s of toDelete) { try { const { rmSync } = await import("node:fs"); rmSync(s.path); deleted++; } catch { /* Skip undeletable sessions. */ } }
+			ctx.ui.notify(`Deleted ${deleted} session${deleted === 1 ? "" : "s"}.`, "info");
+		}
+		else if (result.type === "toggle-notes-context") {
+			const enabled = notesContextEnabled(current.path);
+			const next = !enabled;
+			saveNotesContext(current.path, next);
+			ctx.ui.notify(next ? "📌 Notes will be included in context from the next message." : "Notes removed from context.", "info");
+		}
+		else if (result.type === "approval-log") {
+			const entries = readApprovalLog();
+			if (!entries.length) { ctx.ui.notify("No approval log entries yet.", "info"); return; }
+			const today = new Date().toDateString();
+			const todayEntries = entries.filter((e) => new Date(e.timestamp).toDateString() === today);
+			const rows = (todayEntries.length ? todayEntries : entries.slice(0, 20)).map((e) => {
+				const time = new Date(e.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+				const verdict = e.approved ? (e.approval === "deny" ? "deny" : "allow") : "deny";
+				return `${time}  ${verdict.padEnd(5)}  ${e.operation}  (${e.tool})`;
+			});
+			const header = todayEntries.length ? `Today's approvals (${todayEntries.length})` : `Recent approvals (${rows.length})`;
+			await ctx.ui.select(header + "\n\nTime   Verdict  Operation  (tool)\n" + rows.join("\n"), ["Close"]);
 		}
 		else if (result.type === "organize-skills") { await organizeSkillFolders(ctx); await open(ctx); }
 		else if (result.type === "use-skill") {

@@ -142,13 +142,13 @@ function paint(line: string, colors: string, theme: Theme): string {
 
 function splash(theme: Theme, width: number): string[] {
 	const label = `${theme.bold(theme.fg("error", "◆"))}${theme.fg("text", "  ID: 沫路")} ${theme.fg("dim", "// PI ARSENAL")}`;
-	const artWidth = Math.max(...PORTRAIT.map(visibleWidth), visibleWidth(label));
-	if (width < artWidth) return [truncateToWidth(label, width)];
-	const center = (line: string) => " ".repeat(Math.max(0, Math.floor((width - artWidth) / 2))) + line;
-	const logoWidth = Math.max(...ARSENAL_LOGO.map(visibleWidth));
-	if (width < Math.max(artWidth, logoWidth)) return [truncateToWidth(label, width)];
-	const centerLogo = (line: string) => " ".repeat(Math.max(0, Math.floor((width - logoWidth) / 2))) + theme.fg("error", line);
-	return ["", ...PORTRAIT.map((line, index) => center(paint(line, COLOR_MASK[index] || "", theme))), "", ...ARSENAL_LOGO.map(centerLogo), center(label), ""];
+	// Use a single block width so PORTRAIT, ARSENAL_LOGO, and label all share
+	// the same centre point and never drift apart on wide terminals.
+	const blockWidth = Math.max(...PORTRAIT.map(visibleWidth), ...ARSENAL_LOGO.map(visibleWidth), visibleWidth(label));
+	if (width < blockWidth) return [truncateToWidth(label, width)];
+	const pad = " ".repeat(Math.max(0, Math.floor((width - blockWidth) / 2)));
+	const center = (line: string) => pad + line;
+	return ["", ...PORTRAIT.map((line, index) => center(paint(line, COLOR_MASK[index] || "", theme))), "", ...ARSENAL_LOGO.map((line) => center(theme.fg("error", line))), center(label), ""];
 }
 
 export default function startupSplash(pi: ExtensionAPI) {

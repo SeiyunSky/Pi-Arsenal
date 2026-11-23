@@ -4,27 +4,32 @@ import { basename, dirname, extname, join, parse, relative, resolve, sep } from 
 import { spawn } from "node:child_process";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
-import { openSessionLibrary } from "../lib/session-library.ts";
+import { openSessionLibrary, listSessions, sessionTitle, relativeTime } from "../lib/session-library.ts";
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Focusable } from "@earendil-works/pi-tui";
 
 const STATE_TYPE = "terra-workspace-v1";
 const ROOT = process.env.USERPROFILE || process.env.HOME || ".";
 const WORKSPACES_FILE = join(ROOT, ".pi", "agent", "workspaces.json");
-const MODELS_FILE = join(ROOT, ".pi", "agent", "models.json");
 const DIAGRAMS_DIR = join(".pi", "diagrams");
 const DIAGRAMS_MANIFEST = "gallery.json";
 const SKILLS_DIR = join(ROOT, ".agents", "skills");
 const DISABLED_SKILLS_DIR = join(ROOT, ".agents", "disabled-skills");
 const MCP_CACHE_FILE = join(ROOT, ".pi", "agent", "mcp-cache.json");
 const RESOURCE_METADATA_FILE = join(ROOT, ".pi", "agent", "resource-library.json");
+const EXTENSIONS_DIR = join(ROOT, ".pi", "agent", "extensions");
 const HIDDEN_NAMES = new Set([".git", "node_modules", ".venv", "__pycache__"]);
 const LIST_PAGE_SIZE = 16;
 const DIAGRAM_PAGE_SIZE = 8;
+const NOTES_FILENAME = ".pi/workspace-notes.md";
+const DIAGRAM_STARTER = "Draw a system architecture diagram for this project.";
 
 type Workspace = { name: string; path: string };
-type View = "home" | "projects" | "files" | "browser" | "usage" | "diagrams" | "skills" | "skill-list" | "skill-detail" | "skill-confirm" | "mcp" | "mcp-detail";
+// "files" view removed — read-only listing with no actionable operations had no UX value.
+// "skill-confirm" view removed — replaced with ctx.ui.confirm() for consistent interaction.
+// Global letter shortcuts (p/f/b/c/d/l/m) removed — undiscoverable with no on-screen hint.
+// Added: "notes" (Workspace Notes), "env-check" (Environment Check) views.
+type View = "home" | "projects" | "browser" | "usage" | "diagrams" | "skills" | "skill-list" | "skill-detail" | "mcp" | "mcp-detail" | "notes" | "env-check";
 type FileItem = { name: string; directory: boolean };
-type Pricing = { input: number; output: number; cacheRead?: number };
 type UsageTotals = { input: number; output: number; cacheRead: number };
 type Diagram = { id: string; title: string; file: string; type?: string; createdAt?: string; summary?: string };
 type Skill = { name: string; description: string; path: string; enabled: boolean };
@@ -34,12 +39,27 @@ type McpServer = { name: string; tools: McpTool[]; cachedAt?: number };
 type ResourceLabels = { displayName?: string; note?: string };
 type ResourceMetadata = { skills?: Record<string, ResourceLabels>; mcp?: Record<string, ResourceLabels> };
 type TranslationStudioBridge = { version: 1; open(ctx: ExtensionCommandContext): Promise<void> };
-type Result = { type: "close" } | { type: "workspace"; workspace: Workspace } | { type: "view-diagram"; diagram: Diagram } | { type: "sessions" | "translation" } | { type: "edit-label"; kind: "skills" | "mcp"; key: string; fallback: string; field: "displayName" | "note" } | { type: "use-skill"; canonicalName: string } | { type: "organize-skills" } | { type: "toggle-skill-folder"; enabled: boolean; relative: string };
+type EnvItem = { label: string; status: "ok" | "warn" | "info"; detail: string };
+type Result =
+	| { type: "close" }
+	| { type: "workspace"; workspace: Workspace }
+	| { type: "view-diagram"; diagram: Diagram }
+	| { type: "diagram-starter" }
+	| { type: "sessions" | "translation" | "search-sessions" }
+	| { type: "edit-label"; kind: "skills" | "mcp"; key: string; fallback: string; field: "displayName" | "note" }
+	| { type: "use-skill"; canonicalName: string }
+	| { type: "organize-skills" }
+	| { type: "toggle-skill-folder"; enabled: boolean; relative: string }
+	| { type: "confirm-skill-toggle"; skill: Skill }
+	| { type: "edit-notes"; workspacePath: string };
+
 const TRANSLATION_BRIDGE_KEY = Symbol.for("pi-translation-studio.bridge.v1");
+const CHOICES_BRIDGE_KEY = Symbol.for("pi-choices.bridge.v1");
 const translationBridge = (): TranslationStudioBridge | undefined => {
 	const bridge = (globalThis as Record<symbol, unknown>)[TRANSLATION_BRIDGE_KEY] as TranslationStudioBridge | undefined;
 	return bridge?.version === 1 ? bridge : undefined;
 };
+const hasChoicesBridge = (): boolean => !!(globalThis as Record<symbol, unknown>)[CHOICES_BRIDGE_KEY];
 
 type MermaidViewer = { server: Server; source: string; title: string; url: string };
 let mermaidViewer: MermaidViewer | undefined;
@@ -63,13 +83,13 @@ function restoredWorkspace(entries: readonly SessionEntry[], fallback: string): 
 	return configuredWorkspaces(fallback)[0]!;
 }
 
-function entries(path: string, directoriesOnly = false): FileItem[] {
+function browserEntries(path: string): FileItem[] {
 	try {
 		return readdirSync(path, { withFileTypes: true })
-			.filter((entry) => !HIDDEN_NAMES.has(entry.name) && (!directoriesOnly || entry.isDirectory()))
-			.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+			.filter((entry) => !HIDDEN_NAMES.has(entry.name) && entry.isDirectory())
+			.sort((a, b) => a.name.localeCompare(b.name))
 			.slice(0, 120)
-			.map((entry) => ({ name: entry.name, directory: entry.isDirectory() }));
+			.map((entry) => ({ name: entry.name, directory: true }));
 	} catch { return []; }
 }
 
@@ -102,6 +122,51 @@ function resourceMetadata(): ResourceMetadata {
 function saveResourceMetadata(data: ResourceMetadata): void {
 	mkdirSync(dirname(RESOURCE_METADATA_FILE), { recursive: true });
 	writeFileSync(RESOURCE_METADATA_FILE, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+}
+
+function workspaceNotes(workspacePath: string): string {
+	try { return readFileSync(join(workspacePath, NOTES_FILENAME), "utf8"); } catch { return ""; }
+}
+
+function saveWorkspaceNotes(workspacePath: string, text: string): void {
+	const file = join(workspacePath, NOTES_FILENAME);
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(file, text, "utf8");
+}
+
+function buildEnvItems(ctx: ExtensionCommandContext, hasTranslation: boolean, hasChoices: boolean): EnvItem[] {
+	const items: EnvItem[] = [];
+	// Local extensions
+	const extFiles: string[] = [];
+	try {
+		for (const item of readdirSync(EXTENSIONS_DIR, { withFileTypes: true })) {
+			if (item.isFile() && (item.name.endsWith(".ts") || item.name.endsWith(".js")) && !item.name.endsWith(".disabled")) extFiles.push(item.name.replace(/\.[^.]+$/, ""));
+		}
+	} catch { /* Directory may not exist. */ }
+	items.push({ label: "Local extensions", status: extFiles.length > 0 ? "ok" : "info", detail: extFiles.length > 0 ? extFiles.join(", ") : "None found" });
+	// pi-choices
+	items.push({ label: "pi-choices", status: hasChoices ? "ok" : "warn", detail: hasChoices ? "Available — Task Plan protection active" : "Not loaded — install pi-arsenal to enable plan protection" });
+	// Translation Studio
+	items.push({ label: "Translation Studio", status: hasTranslation ? "ok" : "info", detail: hasTranslation ? "pi-translation-studio bridge active" : "Not installed (optional)" });
+	// Workspace
+	items.push({ label: "Workspace path", status: existsSync(ctx.cwd) ? "ok" : "warn", detail: existsSync(ctx.cwd) ? ctx.cwd : `Missing: ${ctx.cwd}` });
+	// MCP cache
+	try {
+		const raw = JSON.parse(readFileSync(MCP_CACHE_FILE, "utf8")) as { servers?: Record<string, { cachedAt?: number }> };
+		const servers = Object.keys(raw.servers || {});
+		const timestamps = Object.values(raw.servers || {}).map((s) => s.cachedAt || 0).filter(Boolean);
+		const latest = timestamps.length ? new Date(Math.max(...timestamps)) : null;
+		items.push({ label: "MCP cache", status: servers.length ? "ok" : "info", detail: servers.length ? `${servers.length} server${servers.length === 1 ? "" : "s"} · updated ${latest ? latest.toLocaleDateString() : "unknown"}` : "No cached servers" });
+	} catch { items.push({ label: "MCP cache", status: "info", detail: "No cache file found" }); }
+	// Skills
+	try {
+		let count = 0; const walk = (dir: string) => { for (const item of readdirSync(dir, { withFileTypes: true })) { if (item.isDirectory() && existsSync(join(dir, item.name, "SKILL.md"))) count++; else if (item.isDirectory()) walk(join(dir, item.name)); } }; walk(SKILLS_DIR);
+		items.push({ label: "Active skills", status: count > 0 ? "ok" : "info", detail: `${count} skill${count === 1 ? "" : "s"} in enabled library` });
+	} catch { items.push({ label: "Active skills", status: "info", detail: "Skills directory not found" }); }
+	// Model
+	const model = ctx.model?.id;
+	items.push({ label: "Model", status: model ? "ok" : "warn", detail: model || "Unknown — check Pi model configuration" });
+	return items;
 }
 
 function skillRoot(skill: Skill): string { return skill.enabled ? SKILLS_DIR : DISABLED_SKILLS_DIR; }
@@ -200,6 +265,28 @@ async function organizeSkillFolders(ctx: ExtensionCommandContext): Promise<void>
 	}
 }
 
+async function searchAndOpenSession(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+	if (ctx.mode !== "tui") return;
+	const query = await ctx.ui.input("Search sessions", "");
+	if (!query?.trim()) return;
+	const term = query.trim().toLowerCase();
+	const all = await listSessions();
+	const matched = all.filter((session) => {
+		const title = sessionTitle(session).toLowerCase();
+		const first = session.firstMessage.toLowerCase();
+		return title.includes(term) || first.includes(term);
+	});
+	if (!matched.length) { ctx.ui.notify(`No sessions matching "${query}".`, "info"); return; }
+	const currentPath = ctx.sessionManager.getSessionFile();
+	const options = matched.map((session) => `${sessionTitle(session)} — ${relativeTime(session.modified)} · ${session.messageCount} messages${session.path === currentPath ? "  ● current" : ""}`);
+	const choice = await ctx.ui.select(`Sessions matching "${query}"`, [...options, "Cancel"]);
+	if (!choice || choice === "Cancel") return;
+	const session = matched[options.indexOf(choice)];
+	if (!session || session.path === currentPath) return;
+	await ctx.waitForIdle();
+	await ctx.switchSession(session.path, { withSession: async (replacement) => replacement.ui.notify(`Reloaded: ${sessionTitle(session)}`, "info") });
+}
+
 function isInside(parent: string, child: string): boolean {
 	return child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
 }
@@ -248,11 +335,8 @@ class WorkspaceDrawer implements Focusable {
 	focused = false;
 	private view: View = "home";
 	private selected = 0;
-	private files: FileItem[] | undefined;
 	private browserPath: string | undefined;
-	private browserEntries: FileItem[] = [];
-	private pricing: Pricing | undefined;
-	private pricingLoading = false;
+	private browserItems: FileItem[] = [];
 	private diagramItems: Diagram[] | undefined;
 	private skillItems: Skill[] | undefined;
 	private skillEntryItems: SkillEntry[] = [];
@@ -261,48 +345,51 @@ class WorkspaceDrawer implements Focusable {
 	private selectedSkill: Skill | undefined;
 	private mcpItems: McpServer[] | undefined;
 	private selectedMcp: McpServer | undefined;
+	private envItems: EnvItem[] | undefined;
 
-	constructor(private readonly ctx: ExtensionCommandContext, private readonly workspace: Workspace, private readonly workspaces: Workspace[], private readonly theme: Theme, private readonly done: (result: Result) => void, private readonly tui: { requestRender(): void }, private readonly hasTranslationStudio: boolean) {}
+	constructor(
+		private readonly ctx: ExtensionCommandContext,
+		private readonly workspace: Workspace,
+		private readonly workspaces: Workspace[],
+		private readonly theme: Theme,
+		private readonly done: (result: Result) => void,
+		private readonly tui: { requestRender(): void },
+		private readonly hasTranslationStudio: boolean,
+		private readonly hasPiChoices: boolean,
+	) {}
 
-	private homeItems(): Array<{ label: string; view?: View; result?: "sessions" | "translation" }> {
+	private homeItems(): Array<{ label: string; view?: View; result?: Result["type"] }> {
+		const hasNotes = workspaceNotes(this.workspace.path).trim().length > 0;
 		return [
-			{ label: "📁 Projects", view: "projects" }, { label: "📄 Files", view: "files" }, { label: "🖥️  Browse computer…", view: "browser" }, { label: "💰 Usage & Cost", view: "usage" }, { label: "🗺️  Diagram Gallery", view: "diagrams" }, { label: "🕘 Session Library", result: "sessions" },
+			{ label: "📁 Projects", view: "projects" },
+			{ label: "🖥️  Browse computer…", view: "browser" },
+			{ label: "📊 Session Tokens", view: "usage" },
+			{ label: "🗺️  Diagram Gallery", view: "diagrams" },
+			{ label: "🕘 Session Library", result: "sessions" },
+			{ label: "🔎 Search sessions…", result: "search-sessions" },
 			...(this.hasTranslationStudio ? [{ label: "🌐 Translation Studio", result: "translation" as const }] : []),
-			{ label: "✨ Skill Library", view: "skills" }, { label: "🔌 MCP Servers", view: "mcp" },
+			{ label: `📌 Workspace Notes${hasNotes ? " ·" : ""}`, view: "notes" as View },
+			{ label: "✨ Skill Library", view: "skills" },
+			{ label: "🔌 MCP Servers", view: "mcp" },
+			{ label: "🔍 Environment Check", view: "env-check" as View },
 		];
 	}
 
 	private open(view: View): void {
 		this.view = view;
 		this.selected = 0;
-		if (view === "files" && !this.files) this.files = entries(this.workspace.path);
 		if (view === "browser") this.openBrowser(this.browserPath);
-		if (view === "usage") void this.loadPricing();
 		if (view === "diagrams") this.diagramItems = diagrams(this.workspace.path);
 		if (view === "skills") this.skillItems = skills();
 		if (view === "skill-list") this.skillEntryItems = skillEntries(this.skillEnabled, this.skillDirectory);
 		if (view === "mcp") this.mcpItems = cachedMcpServers();
-	}
-
-	private async loadPricing(): Promise<void> {
-		if (this.pricing || this.pricingLoading) return;
-		this.pricingLoading = true;
-		try {
-			const config = JSON.parse(readFileSync(MODELS_FILE, "utf8")).providers?.["litellm-openai"] as { baseUrl?: string; apiKey?: string } | undefined;
-			if (!config?.baseUrl || !config.apiKey || !this.ctx.model?.id) return;
-			const response = await fetch(`${config.baseUrl.replace(/\/v1\/?$/, "")}/model/info`, { headers: { Authorization: `Bearer ${config.apiKey}` }, signal: AbortSignal.timeout(5_000) });
-			if (!response.ok) return;
-			const data = await response.json() as { data?: Array<{ model_name?: string; model_info?: { input_cost_per_token?: number; output_cost_per_token?: number; cache_read_input_token_cost?: number } }> };
-			const info = data.data?.find((item) => item.model_name === this.ctx.model?.id)?.model_info;
-			if (info?.input_cost_per_token !== undefined && info.output_cost_per_token !== undefined) this.pricing = { input: info.input_cost_per_token, output: info.output_cost_per_token, cacheRead: info.cache_read_input_token_cost };
-		} catch { /* Usage remains available without price data. */ }
-		finally { this.pricingLoading = false; this.tui.requestRender(); }
+		if (view === "env-check") this.envItems = buildEnvItems(this.ctx, this.hasTranslationStudio, this.hasPiChoices);
 	}
 
 	private openBrowser(path: string | undefined): void {
 		this.browserPath = path;
 		this.selected = 0;
-		this.browserEntries = path ? entries(path, true) : driveRoots().map((root) => ({ name: root, directory: true }));
+		this.browserItems = path ? browserEntries(path) : driveRoots().map((root) => ({ name: root, directory: true }));
 	}
 
 	private backBrowser(): void {
@@ -313,54 +400,72 @@ class WorkspaceDrawer implements Focusable {
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) {
-			if (this.view === "home") this.done({ type: "close" });
-			else if (this.view === "browser") this.backBrowser();
-			else if (this.view === "skill-list") { if (this.skillDirectory) { this.skillDirectory = dirname(this.skillDirectory); if (this.skillDirectory === ".") this.skillDirectory = ""; this.open("skill-list"); } else this.open("skills"); }
-			else if (this.view === "skill-detail") this.open("skill-list");
-			else if (this.view === "skill-confirm") this.open("skill-detail");
-			else if (this.view === "mcp-detail") this.open("mcp");
-			else { this.view = "home"; this.selected = 0; }
-			return;
+			if (this.view === "home") { this.done({ type: "close" }); return; }
+			if (this.view === "browser") { this.backBrowser(); return; }
+			if (this.view === "skill-list") {
+				if (this.skillDirectory) { this.skillDirectory = dirname(this.skillDirectory); if (this.skillDirectory === ".") this.skillDirectory = ""; this.open("skill-list"); }
+				else this.open("skills");
+				return;
+			}
+			if (this.view === "skill-detail") { this.open("skill-list"); return; }
+			if (this.view === "mcp-detail") { this.open("mcp"); return; }
+			this.view = "home"; this.selected = 0; return;
 		}
-		if (matchesKey(data, "p")) { this.open("projects"); return; }
-		if (matchesKey(data, "f")) { this.open("files"); return; }
-		if (matchesKey(data, "b")) { this.open("browser"); return; }
-		if (matchesKey(data, "c")) { this.open("usage"); return; }
-		if (matchesKey(data, "d")) { this.open("diagrams"); return; }
-		if (matchesKey(data, "l")) { this.open("skills"); return; }
-		if (matchesKey(data, "m")) { this.open("mcp"); return; }
+		// MCP detail label shortcuts — shown in footer so discoverable
 		if (matchesKey(data, "n") && this.view === "mcp-detail" && this.selectedMcp) { this.done({ type: "edit-label", kind: "mcp", key: this.selectedMcp.name, fallback: this.selectedMcp.name, field: "displayName" }); return; }
 		if (matchesKey(data, "o") && this.view === "mcp-detail" && this.selectedMcp) { this.done({ type: "edit-label", kind: "mcp", key: this.selectedMcp.name, fallback: this.selectedMcp.name, field: "note" }); return; }
-		if (matchesKey(data, "s") && this.view === "browser" && this.browserPath) { this.setCurrentDirectory(); return; }
+		// Browser workspace-select shortcut
+		if (matchesKey(data, "s") && this.view === "browser" && this.browserPath) { this.done({ type: "workspace", workspace: { name: basename(parse(this.browserPath).root === this.browserPath ? this.browserPath : this.browserPath) || this.browserPath, path: this.browserPath } }); return; }
 		if (matchesKey(data, Key.up) || matchesKey(data, "k")) { this.selected = Math.max(0, this.selected - 1); return; }
 		if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
-			const last = this.view === "projects" ? this.workspaces.length : this.view === "files" ? Math.max(0, (this.files?.length || 1) - 1) : this.view === "browser" ? Math.max(0, this.browserEntries.length - 1) : this.view === "diagrams" ? Math.max(0, (this.diagramItems?.length || 1) - 1) : this.view === "skills" ? 1 : this.view === "skill-list" ? this.skillEntryItems.length + (this.skillDirectory ? 1 : 0) : this.view === "skill-detail" ? (this.selectedSkill?.enabled ? 3 : 2) : this.view === "mcp" ? Math.max(0, (this.mcpItems?.length || 1) - 1) : this.view === "mcp-detail" ? Math.max(0, (this.selectedMcp?.tools.length || 1) - 1) : this.view === "usage" ? 0 : this.homeItems().length - 1;
-			this.selected = Math.min(last, this.selected + 1);
-			return;
+			const last =
+				this.view === "projects" ? this.workspaces.length :
+				this.view === "browser" ? Math.max(0, this.browserItems.length - 1) :
+				this.view === "diagrams" ? Math.max(0, (this.diagramItems?.length ?? 0) > 0 ? (this.diagramItems!.length - 1) : 0) :
+				this.view === "skills" ? 1 :
+				this.view === "skill-list" ? this.skillEntryItems.length + (this.skillDirectory ? 1 : 0) :
+				this.view === "skill-detail" ? (this.selectedSkill?.enabled ? 3 : 2) :
+				this.view === "mcp" ? Math.max(0, (this.mcpItems?.length || 1) - 1) :
+				this.view === "mcp-detail" ? Math.max(0, (this.selectedMcp?.tools.length || 1) - 1) :
+				this.view === "usage" || this.view === "notes" || this.view === "env-check" ? 0 :
+				this.homeItems().length - 1;
+			this.selected = Math.min(last, this.selected + 1); return;
 		}
 		if (!matchesKey(data, Key.enter) && !matchesKey(data, Key.right)) return;
+		// notes: Enter opens editor outside the custom UI
+		if (this.view === "notes") { this.done({ type: "edit-notes", workspacePath: this.workspace.path }); return; }
+		if (this.view === "mcp-detail" || this.view === "usage" || this.view === "env-check") return;
+		// diagrams: empty state has a starter prompt at index 0
+		if (this.view === "diagrams") {
+			const gallery = this.diagramItems || [];
+			if (gallery.length === 0 && this.selected === 0) { this.done({ type: "diagram-starter" }); return; }
+			const diagram = gallery[this.selected]; if (diagram) this.done({ type: "view-diagram", diagram }); return;
+		}
 		if (this.view === "home") {
 			const item = this.homeItems()[this.selected];
-			if (item?.result) this.done({ type: item.result });
+			if (item?.result) this.done({ type: item.result as Result["type"] } as Result);
 			else if (item?.view) this.open(item.view);
 			return;
 		}
 		if (this.view === "skills") { this.skillEnabled = this.selected === 0; this.skillDirectory = ""; this.open("skill-list"); return; }
-		if (this.view === "skill-list") { const entry = this.skillEntryItems[this.selected]; if (entry?.type === "skill") { this.selectedSkill = entry.skill; this.open("skill-detail"); } else if (entry?.type === "folder") { this.skillDirectory = entry.relative; this.open("skill-list"); } else if (this.skillDirectory && this.selected === this.skillEntryItems.length) this.done({ type: "toggle-skill-folder", enabled: this.skillEnabled, relative: this.skillDirectory }); else this.done({ type: "organize-skills" }); return; }
+		if (this.view === "skill-list") {
+			const entry = this.skillEntryItems[this.selected];
+			if (entry?.type === "skill") { this.selectedSkill = entry.skill; this.open("skill-detail"); }
+			else if (entry?.type === "folder") { this.skillDirectory = entry.relative; this.open("skill-list"); }
+			else if (this.skillDirectory && this.selected === this.skillEntryItems.length) this.done({ type: "toggle-skill-folder", enabled: this.skillEnabled, relative: this.skillDirectory });
+			else this.done({ type: "organize-skills" });
+			return;
+		}
 		if (this.view === "skill-detail") {
 			if (!this.selectedSkill) return;
 			const offset = this.selectedSkill.enabled ? 1 : 0;
 			if (this.selectedSkill.enabled && this.selected === 0) this.done({ type: "use-skill", canonicalName: this.selectedSkill.name });
 			else if (this.selected === offset) this.done({ type: "edit-label", kind: "skills", key: skillKey(this.selectedSkill), fallback: this.selectedSkill.name, field: "displayName" });
 			else if (this.selected === offset + 1) this.done({ type: "edit-label", kind: "skills", key: skillKey(this.selectedSkill), fallback: this.selectedSkill.name, field: "note" });
-			else this.open("skill-confirm");
+			else this.done({ type: "confirm-skill-toggle", skill: this.selectedSkill });
 			return;
 		}
-		if (this.view === "skill-confirm") { if (!this.selectedSkill) return; try { this.selectedSkill = moveSkill(this.selectedSkill, this.selectedSkill.enabled ? DISABLED_SKILLS_DIR : SKILLS_DIR, skillKey(this.selectedSkill)); this.skillEnabled = this.selectedSkill.enabled; this.skillDirectory = dirname(skillKey(this.selectedSkill)); if (this.skillDirectory === ".") this.skillDirectory = ""; this.open("skill-list"); } catch { /* Keep UI responsive; inability to move is visible on the unchanged list. */ } return; }
 		if (this.view === "mcp") { const server = this.mcpItems?.[this.selected]; if (server) { this.selectedMcp = server; this.open("mcp-detail"); } return; }
-		if (this.view === "mcp-detail") return;
-		if (this.view === "files" || this.view === "usage") return;
-		if (this.view === "diagrams") { const diagram = this.diagramItems?.[this.selected]; if (diagram) this.done({ type: "view-diagram", diagram }); return; }
 		if (this.view === "projects") {
 			if (this.selected === this.workspaces.length) { this.open("browser"); return; }
 			const next = this.workspaces[this.selected];
@@ -368,13 +473,9 @@ class WorkspaceDrawer implements Focusable {
 			return;
 		}
 		if (this.view === "browser") {
-			const next = this.browserEntries[this.selected];
+			const next = this.browserItems[this.selected];
 			if (next) this.openBrowser(this.browserPath ? join(this.browserPath, next.name) : next.name);
 		}
-	}
-
-	private setCurrentDirectory(): void {
-		if (this.browserPath) this.done({ type: "workspace", workspace: { name: basename(parse(this.browserPath).root === this.browserPath ? this.browserPath : this.browserPath) || this.browserPath, path: this.browserPath } });
 	}
 
 	render(_width: number): string[] {
@@ -382,81 +483,222 @@ class WorkspaceDrawer implements Focusable {
 		const inner = this.width - 2;
 		const row = (text: string) => th.fg("border", "│") + truncateToWidth(text, inner) + " ".repeat(Math.max(0, inner - visibleWidth(text))) + th.fg("border", "│");
 		const marker = (index: number) => index === this.selected ? th.fg("accent", "›") : " ";
-		const title = this.view === "home" ? "Terra Workspace" : this.view === "projects" ? "Projects" : this.view === "files" ? "Files" : this.view === "usage" ? "Usage & Cost" : this.view === "diagrams" ? "Diagram Gallery" : this.view === "skills" ? "Skill Library" : this.view === "skill-list" ? (this.skillEnabled ? "Enabled Skills" : "Disabled Skills") : this.view === "skill-detail" ? "Skill Details" : this.view === "skill-confirm" ? "Confirm Skill Change" : this.view === "mcp" ? "MCP Servers" : this.view === "mcp-detail" ? "MCP Server Details" : "Browse computer";
-		const lines = [th.fg("borderAccent", `╭─ ${title} ${"─".repeat(Math.max(0, inner - visibleWidth(title) - 3))}╮`)];
+
+		const viewTitle: Record<View, string> = {
+			home: "Terra Workspace",
+			projects: "Projects",
+			browser: "Browse computer",
+			usage: "Session Tokens",
+			diagrams: "Diagram Gallery",
+			skills: "Skill Library",
+			"skill-list": this.skillEnabled ? "Enabled Skills" : "Disabled Skills",
+			"skill-detail": "Skill Details",
+			mcp: "MCP Servers",
+			"mcp-detail": "MCP Server Details",
+			notes: "Workspace Notes",
+			"env-check": "Environment Check",
+		};
+		const lines = [th.fg("borderAccent", `╭─ ${viewTitle[this.view]} ${"─".repeat(Math.max(0, inner - visibleWidth(viewTitle[this.view]) - 3))}╮`)];
+
 		if (this.view === "home") {
-			lines.push(row(` ${th.fg("accent", "◈")} ${th.bold(this.workspace.name)}`));
+			const hasNotes = workspaceNotes(this.workspace.path).trim().length > 0;
+			lines.push(row(` ${th.fg("accent", "◈")} ${th.bold(this.workspace.name)}${hasNotes ? ` ${th.fg("warning", "📌")}` : ""}`));
 			lines.push(row(` ${th.fg("dim", this.workspace.path)}`));
 			lines.push(row(""));
 			for (const [i, item] of this.homeItems().entries()) lines.push(row(` ${marker(i)} ${th.fg("text", item.label)}`));
 			lines.push(row(""));
-			lines.push(row(th.fg("dim", "↑ ↓ select · Enter / → open · Esc / ← close")));
+			lines.push(row(th.fg("dim", "↑ ↓ select · Enter / → open · Esc close")));
+
 		} else if (this.view === "projects") {
-			lines.push(row(th.fg("muted", "Saved project roots for this Session")));
+			lines.push(row(th.fg("muted", "Saved project roots for this session")));
 			lines.push(row(""));
-			for (let i = 0; i < this.workspaces.length; i++) { const item = this.workspaces[i]!; lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "text" : "muted", item.name)}`)); lines.push(row(`   ${th.fg("dim", item.path)}`)); }
+			for (let i = 0; i < this.workspaces.length; i++) {
+				const item = this.workspaces[i]!;
+				lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "text" : "muted", item.name)}`));
+				lines.push(row(`   ${th.fg("dim", item.path)}`));
+			}
 			lines.push(row(` ${marker(this.workspaces.length)} ${th.fg("accent", "Browse computer…")}`));
-			lines.push(row("")); lines.push(row(th.fg("dim", "Enter / → apply · Esc / ← back")));
-		} else if (this.view === "files") {
-			lines.push(row(th.fg("muted", "Current Workspace root · read-only"))); lines.push(row("")); this.renderItems(lines, row, marker, this.files || []); lines.push(row("")); lines.push(row(th.fg("dim", "Esc / ← back")));
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "Enter / → apply · Esc / ← back")));
+
 		} else if (this.view === "usage") {
 			const totals = sessionUsage(this.ctx), context = this.ctx.getContextUsage();
-			const estimated = this.pricing ? totals.input * this.pricing.input + totals.output * this.pricing.output + totals.cacheRead * (this.pricing.cacheRead ?? this.pricing.input) : undefined;
-			lines.push(row(th.fg("muted", "Current Session · local LiteLLM price estimate"))); lines.push(row(""));
-			for (const value of [`Model       ${this.ctx.model?.id || "unknown"}`, `Input       ${formatTokens(totals.input)} tokens`, `Output      ${formatTokens(totals.output)} tokens`, `Cache read  ${formatTokens(totals.cacheRead)} tokens`, `Context     ${context?.tokens ?? "—"} / ${context?.contextWindow ?? "—"}`]) lines.push(row(value));
-			lines.push(row("")); lines.push(row(`${th.fg("accent", "Estimated")}   ${estimated === undefined ? this.pricingLoading ? "loading local prices…" : "price unavailable" : `$${estimated.toFixed(4)}`}`)); lines.push(row(th.fg("dim", "Estimate only; not a provider invoice. Esc / ← back")));
+			lines.push(row(th.fg("muted", "Current session token usage")));
+			lines.push(row(""));
+			lines.push(row(`Model       ${th.fg("text", this.ctx.model?.id || "—")}`));
+			lines.push(row(""));
+			lines.push(row(`Input       ${th.fg("accent", formatTokens(totals.input))} tokens`));
+			lines.push(row(`Output      ${th.fg("accent", formatTokens(totals.output))} tokens`));
+			lines.push(row(`Cache read  ${th.fg("accent", formatTokens(totals.cacheRead))} tokens`));
+			lines.push(row(`Total       ${th.fg("accent", formatTokens(totals.input + totals.output + totals.cacheRead))} tokens`));
+			lines.push(row(""));
+			lines.push(row(`Context     ${th.fg("accent", String(context?.tokens ?? "—"))} / ${th.fg("dim", String(context?.contextWindow ?? "—"))}`));
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "Session only · Esc / ← back")));
+
 		} else if (this.view === "diagrams") {
 			const gallery = this.diagramItems || [];
-			lines.push(row(th.fg("muted", "Mermaid diagrams explicitly generated and registered by Pi"))); lines.push(row(""));
+			lines.push(row(th.fg("muted", "Mermaid diagrams registered for this workspace")));
+			lines.push(row(""));
 			if (gallery.length) {
 				const start = Math.floor(this.selected / DIAGRAM_PAGE_SIZE) * DIAGRAM_PAGE_SIZE;
-				for (let i = start; i < Math.min(start + DIAGRAM_PAGE_SIZE, gallery.length); i++) { const diagram = gallery[i]!; lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "accent" : "text", diagram.title)}`)); lines.push(row(`   ${th.fg("dim", `${diagram.type || "mermaid"}${diagram.createdAt ? ` · ${diagram.createdAt}` : ""}`)}`)); }
+				for (let i = start; i < Math.min(start + DIAGRAM_PAGE_SIZE, gallery.length); i++) {
+					const diagram = gallery[i]!;
+					lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "accent" : "text", diagram.title)}`));
+					lines.push(row(`   ${th.fg("dim", `${diagram.type || "mermaid"}${diagram.createdAt ? ` · ${diagram.createdAt}` : ""}`)}`));
+				}
 				if (gallery.length > DIAGRAM_PAGE_SIZE) lines.push(row(th.fg("dim", `Page ${Math.floor(start / DIAGRAM_PAGE_SIZE) + 1} / ${Math.ceil(gallery.length / DIAGRAM_PAGE_SIZE)} · ↑ ↓ to browse`)));
-				lines.push(row("")); lines.push(row(th.fg("dim", "Enter / → open in browser · Esc / ← back")));
-			} else { lines.push(row(th.fg("dim", "No Mermaid diagrams yet."))); lines.push(row(th.fg("dim", "Ask Pi to generate a Mermaid diagram; it will appear here."))); lines.push(row("")); lines.push(row(th.fg("dim", "Esc / ← back"))); }
+				lines.push(row(""));
+				lines.push(row(th.fg("dim", "Enter / → open in browser · Esc / ← back")));
+			} else {
+				lines.push(row(th.fg("dim", "No Mermaid diagrams yet.")));
+				lines.push(row(""));
+				lines.push(row(th.fg("muted", "Try asking Pi:")));
+				lines.push(row(` ${marker(0)} ${th.fg("accent", `"${DIAGRAM_STARTER}"`)}`));
+				lines.push(row(""));
+				lines.push(row(th.fg("dim", "Enter sends prompt to editor · Esc / ← back")));
+			}
+
+		} else if (this.view === "notes") {
+			const content = workspaceNotes(this.workspace.path);
+			lines.push(row(th.fg("muted", `📌 ${this.workspace.name}`)));
+			lines.push(row(""));
+			if (content.trim()) {
+				for (const line of content.split("\n").slice(0, 18)) lines.push(row(` ${th.fg("text", line)}`));
+				if (content.split("\n").length > 18) lines.push(row(th.fg("dim", ` … ${content.split("\n").length - 18} more lines`)));
+			} else {
+				lines.push(row(th.fg("dim", "No notes yet.")));
+				lines.push(row(th.fg("dim", "Personal reminders about this project.")));
+				lines.push(row(th.fg("dim", "Not sent to the model.")));
+			}
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "Enter edit · Esc / ← back")));
+
+		} else if (this.view === "env-check") {
+			const items = this.envItems || [];
+			lines.push(row(th.fg("muted", "Arsenal extension and environment status")));
+			lines.push(row(""));
+			for (const item of items) {
+				const icon = item.status === "ok" ? th.fg("success", "✓") : item.status === "warn" ? th.fg("error", "!") : th.fg("dim", "·");
+				lines.push(row(` ${icon} ${th.fg(item.status === "warn" ? "error" : "text", item.label)}`));
+				lines.push(row(`   ${th.fg("dim", item.detail)}`));
+			}
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "Esc / ← back")));
+
 		} else if (this.view === "skills") {
-			const activeCount = (this.skillItems || []).filter((skill) => skill.enabled).length, disabledCount = (this.skillItems || []).length - activeCount;
-			lines.push(row(th.fg("muted", "Choose a library · disabled skills stay outside Pi discovery"))); lines.push(row(""));
+			const allSkills = this.skillItems || [];
+			const activeCount = allSkills.filter((skill) => skill.enabled).length;
+			const disabledCount = allSkills.length - activeCount;
+			lines.push(row(th.fg("muted", "Choose a library to browse or manage skills")));
+			lines.push(row(""));
 			lines.push(row(` ${marker(0)} ${th.fg("accent", `✨ Enabled skills · ${activeCount}`)}`));
 			lines.push(row(` ${marker(1)} ${th.fg("muted", `💤 Disabled skills · ${disabledCount}`)}`));
-			lines.push(row("")); lines.push(row(th.fg("dim", "Enter / → open · Esc / ← back")));
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "Enter / → open · Esc / ← back")));
+
 		} else if (this.view === "skill-list") {
 			const list = this.skillEntryItems, location = this.skillDirectory || "Library root";
-			lines.push(row(th.fg("muted", `${this.skillEnabled ? "Enabled" : "Disabled"} · 📂 ${location}`))); lines.push(row(""));
+			lines.push(row(th.fg("muted", `${this.skillEnabled ? "Enabled" : "Disabled"} · 📂 ${location}`)));
+			lines.push(row(""));
 			if (!list.length) lines.push(row(th.fg("dim", "This folder is empty.")));
-			else for (let i = 0; i < list.length; i++) { const entry = list[i]!; if (entry.type === "folder") { const color = categoryColor(entry.relative), count = skillCount(join(this.skillEnabled ? SKILLS_DIR : DISABLED_SKILLS_DIR, entry.relative)); lines.push(row(` ${marker(i)} ${th.fg(color, `📂 ${entry.name}`)} ${th.fg("dim", `· ${count} skill${count === 1 ? "" : "s"}`)}`)); } else { const skill = entry.skill, category = categoryOf(skill), custom = displayName("skills", skillKey(skill), skill.name); lines.push(row(` ${marker(i)} ${th.fg(categoryColor(category), `${this.skillEnabled ? "✨" : "💤"} ${custom}`)}`)); lines.push(row(`   ${th.fg("dim", labelsFor("skills", skillKey(skill)).note || skill.description)}`)); } }
+			else for (let i = 0; i < list.length; i++) {
+				const entry = list[i]!;
+				if (entry.type === "folder") {
+					const color = categoryColor(entry.relative), count = skillCount(join(this.skillEnabled ? SKILLS_DIR : DISABLED_SKILLS_DIR, entry.relative));
+					lines.push(row(` ${marker(i)} ${th.fg(color, `📂 ${entry.name}`)} ${th.fg("dim", `· ${count} skill${count === 1 ? "" : "s"}`)}`));
+				} else {
+					const skill = entry.skill, category = categoryOf(skill), custom = displayName("skills", skillKey(skill), skill.name);
+					lines.push(row(` ${marker(i)} ${th.fg(categoryColor(category), `${this.skillEnabled ? "✨" : "💤"} ${custom}`)}`));
+					lines.push(row(`   ${th.fg("dim", labelsFor("skills", skillKey(skill)).note || skill.description)}`));
+				}
+			}
 			const actionIndex = list.length;
 			if (this.skillDirectory) lines.push(row(` ${marker(actionIndex)} ${th.fg("warning", `${this.skillEnabled ? "💤 Disable" : "✨ Enable"} this folder`)}`));
-			lines.push(row(` ${marker(actionIndex + (this.skillDirectory ? 1 : 0))} ${th.fg("accent", "📂 Organize folders…")}`)); lines.push(row("")); lines.push(row(th.fg("dim", "Enter / → open/action · Esc / ← up")));
+			lines.push(row(` ${marker(actionIndex + (this.skillDirectory ? 1 : 0))} ${th.fg("accent", "📂 Organize folders…")}`));
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "Enter / → open/action · Esc / ← up")));
+
 		} else if (this.view === "skill-detail") {
 			const skill = this.selectedSkill;
-			if (skill) { const labels = labelsFor("skills", skillKey(skill)), category = categoryOf(skill), color = categoryColor(category); lines.push(row(`${th.fg(color, skill.enabled ? "✨ Enabled" : "💤 Disabled")} · ${th.fg(color, displayName("skills", skillKey(skill), skill.name))}`)); lines.push(row(th.fg(color, `📂 ${category}`))); lines.push(row("")); if (labels.note) { lines.push(row(th.fg("muted", labels.note))); lines.push(row("")); } lines.push(row(th.fg("dim", `Original: ${skill.name}`))); lines.push(row(th.fg("dim", skill.description))); lines.push(row("")); const actions = skill.enabled ? ["Use this skill now", "Edit display name", "Edit personal note", "Disable this skill"] : ["Edit display name", "Edit personal note", "Enable this skill"]; for (const [i, action] of actions.entries()) lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "accent" : "text", action)}`)); }
-			lines.push(row("")); lines.push(row(th.fg("dim", "↑ ↓ select · Enter / → confirm · Esc / ← back")));
-		} else if (this.view === "skill-confirm") {
-			const skill = this.selectedSkill;
-			if (skill) { const action = skill.enabled ? "Disable" : "Enable"; lines.push(row(th.fg("accent", `⚠️  ${action} ${skill.name}?`))); lines.push(row("")); lines.push(row(th.fg("muted", skill.enabled ? "It will move to disabled-skills; nothing is deleted." : "It will move back to the active skills directory."))); lines.push(row(th.fg("muted", "Pi will apply the change after /reload."))); lines.push(row("")); lines.push(row(th.fg("accent", "Enter / → confirm · Esc / ← cancel"))); }
+			if (skill) {
+				const labels = labelsFor("skills", skillKey(skill)), category = categoryOf(skill), color = categoryColor(category);
+				lines.push(row(`${th.fg(color, skill.enabled ? "✨ Enabled" : "💤 Disabled")} · ${th.fg(color, displayName("skills", skillKey(skill), skill.name))}`));
+				lines.push(row(th.fg(color, `📂 ${category}`)));
+				lines.push(row(""));
+				if (labels.note) { lines.push(row(th.fg("muted", labels.note))); lines.push(row("")); }
+				lines.push(row(th.fg("dim", `Original: ${skill.name}`)));
+				lines.push(row(th.fg("dim", skill.description)));
+				lines.push(row(""));
+				const actions = skill.enabled
+					? ["Use this skill now", "Edit display name", "Edit personal note", "Disable this skill"]
+					: ["Edit display name", "Edit personal note", "Enable this skill"];
+				for (const [i, action] of actions.entries()) lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "accent" : "text", action)}`));
+			}
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "↑ ↓ select · Enter / → confirm · Esc / ← back")));
+
 		} else if (this.view === "mcp") {
 			const list = this.mcpItems || [];
-			lines.push(row(th.fg("muted", "🔌 Managed by the MCP plugin · cached discovered tools"))); lines.push(row(""));
-			if (!list.length) lines.push(row(th.fg("dim", "No cached MCP servers. Use the MCP plugin to discover them.")));
-			else for (let i = 0; i < list.length; i++) { const server = list[i]!; const labels = labelsFor("mcp", server.name); lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "accent" : "text", `🔌 ${displayName("mcp", server.name, server.name)}`)}`)); lines.push(row(`   ${th.fg("dim", labels.note || `${server.tools.length} cached tool${server.tools.length === 1 ? "" : "s"}`)}`)); }
-			lines.push(row("")); lines.push(row(th.fg("dim", "Enter / → tools · Esc / ← back")));
+			lines.push(row(th.fg("muted", "Cached MCP servers · secrets are never shown")));
+			lines.push(row(""));
+			if (!list.length) {
+				lines.push(row(th.fg("dim", "No cached MCP servers.")));
+				lines.push(row(th.fg("dim", "Use the MCP plugin to discover and cache servers.")));
+			} else {
+				for (let i = 0; i < list.length; i++) {
+					const server = list[i]!;
+					const labels = labelsFor("mcp", server.name);
+					lines.push(row(` ${marker(i)} ${th.fg(i === this.selected ? "accent" : "text", `🔌 ${displayName("mcp", server.name, server.name)}`)}`));
+					lines.push(row(`   ${th.fg("dim", labels.note || `${server.tools.length} cached tool${server.tools.length === 1 ? "" : "s"}`)}`));
+				}
+			}
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "Enter / → details · Esc / ← back")));
+
 		} else if (this.view === "mcp-detail") {
 			const server = this.selectedMcp;
-			if (server) { const labels = labelsFor("mcp", server.name); lines.push(row(th.fg("accent", `🔌 ${displayName("mcp", server.name, server.name)}`))); if (labels.note) lines.push(row(th.fg("muted", labels.note))); lines.push(row(th.fg("dim", `Original: ${server.name}`))); lines.push(row(th.fg("muted", `${server.tools.length} cached tool${server.tools.length === 1 ? "" : "s"} · secrets are never shown`))); lines.push(row("")); if (server.tools.length) { const start = Math.floor(this.selected / LIST_PAGE_SIZE) * LIST_PAGE_SIZE; for (let i = start; i < Math.min(start + LIST_PAGE_SIZE, server.tools.length); i++) { const tool = server.tools[i]!; lines.push(row(` ${marker(i)} ${th.fg("text", tool.name)}`)); if (tool.description) lines.push(row(`   ${th.fg("dim", tool.description)}`)); } } else lines.push(row(th.fg("dim", "No cached tools."))); lines.push(row("")); lines.push(row(th.fg("dim", "N edit display name · O edit personal note"))); }
-			lines.push(row(th.fg("dim", "Read-only plugin cache · Esc / ← back")));
-		} else {
-			lines.push(row(th.fg("muted", this.browserPath || "Choose a drive"))); if (this.browserPath) lines.push(row(` ${th.fg("accent", "S")} set this folder as Workspace`)); lines.push(row("")); this.renderItems(lines, row, marker, this.browserEntries); lines.push(row("")); lines.push(row(th.fg("dim", this.browserPath ? "Enter / → folder · S select · Esc / ← up" : "Enter / → drive · Esc / ← back")));
-		}
-		lines.push(th.fg("borderAccent", `╰${"─".repeat(inner)}╯`)); return lines;
-	}
+			if (server) {
+				const labels = labelsFor("mcp", server.name);
+				lines.push(row(th.fg("accent", `🔌 ${displayName("mcp", server.name, server.name)}`))); 
+				if (labels.note) lines.push(row(th.fg("muted", labels.note)));
+				lines.push(row(th.fg("dim", `Original: ${server.name}`)));
+				lines.push(row(th.fg("muted", `${server.tools.length} tool${server.tools.length === 1 ? "" : "s"} cached · secrets never shown`)));
+				lines.push(row(""));
+				if (server.tools.length) {
+					const start = Math.floor(this.selected / LIST_PAGE_SIZE) * LIST_PAGE_SIZE;
+					for (let i = start; i < Math.min(start + LIST_PAGE_SIZE, server.tools.length); i++) {
+						const tool = server.tools[i]!;
+						lines.push(row(` ${marker(i)} ${th.fg("text", tool.name)}`));
+						if (tool.description) lines.push(row(`   ${th.fg("dim", tool.description)}`));
+					}
+					if (server.tools.length > LIST_PAGE_SIZE) lines.push(row(th.fg("dim", `Page ${Math.floor(start / LIST_PAGE_SIZE) + 1} / ${Math.ceil(server.tools.length / LIST_PAGE_SIZE)} · ↑ ↓`)));
+				} else { lines.push(row(th.fg("dim", "No cached tools."))); }
+				lines.push(row(""));
+				lines.push(row(th.fg("dim", "N edit display name · O edit note · Esc / ← back")));
+			}
 
-	private renderItems(lines: string[], row: (text: string) => string, marker: (index: number) => string, values: FileItem[]): void {
-		if (!values.length) { lines.push(row(this.theme.fg("dim", " No readable folders here."))); return; }
-		const start = Math.floor(this.selected / LIST_PAGE_SIZE) * LIST_PAGE_SIZE;
-		const end = Math.min(start + LIST_PAGE_SIZE, values.length);
-		for (let i = start; i < end; i++) { const item = values[i]!; lines.push(row(` ${marker(i)} ${this.theme.fg(i === this.selected ? "text" : "muted", `${item.name}${item.directory && !item.name.endsWith("\\") ? "/" : ""}`)}`)); }
-		if (values.length > LIST_PAGE_SIZE) lines.push(row(this.theme.fg("dim", `Page ${Math.floor(start / LIST_PAGE_SIZE) + 1} / ${Math.ceil(values.length / LIST_PAGE_SIZE)} · ↑ ↓ to browse`)));
+		} else {
+			// browser view
+			lines.push(row(th.fg("muted", this.browserPath || "Choose a drive")));
+			if (this.browserPath) lines.push(row(` ${th.fg("accent", "S")} set this folder as Workspace`));
+			lines.push(row(""));
+			if (!this.browserItems.length) { lines.push(row(th.fg("dim", " No sub-folders here."))); }
+			else {
+				const start = Math.floor(this.selected / LIST_PAGE_SIZE) * LIST_PAGE_SIZE;
+				const end = Math.min(start + LIST_PAGE_SIZE, this.browserItems.length);
+				for (let i = start; i < end; i++) {
+					const item = this.browserItems[i]!;
+					lines.push(row(` ${marker(i)} ${this.theme.fg(i === this.selected ? "text" : "muted", `${item.name}/`)}`));
+				}
+				if (this.browserItems.length > LIST_PAGE_SIZE) lines.push(row(this.theme.fg("dim", `Page ${Math.floor(start / LIST_PAGE_SIZE) + 1} / ${Math.ceil(this.browserItems.length / LIST_PAGE_SIZE)} · ↑ ↓`)));
+			}
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", this.browserPath ? "Enter / → folder · S select · Esc / ← up" : "Enter / → drive · Esc / ← back")));
+		}
+
+		lines.push(th.fg("borderAccent", `╰${"─".repeat(inner)}╯`));
+		return lines;
 	}
 
 	invalidate(): void {}
@@ -470,40 +712,81 @@ export default function workspaceDrawer(pi: ExtensionAPI) {
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
 	pi.on("before_agent_start", async (event, ctx) => {
 		const root = active(ctx);
-		return { systemPrompt: `${event.systemPrompt}\n\nActive Workspace: ${root.path}\nInterpret relative file paths, project files, and project commands as referring to this workspace by default. Use paths under it for native file tools and run project shell commands from it. An explicit user-provided absolute path overrides this default.\n\nDiagram Gallery contract: Do not create or register diagrams unless the user explicitly asks you to generate a diagram, chart, architecture view, flowchart, or node graph. For such a request, create Mermaid flowchart/graph source under <Active Workspace>/.pi/diagrams/<stable-id>.mmd and create or update <Active Workspace>/.pi/diagrams/gallery.json in this exact shape: {"diagrams":[{"id":"stable-id","title":"Human title","file":"stable-id.mmd","type":"mermaid","createdAt":"ISO-8601 timestamp","summary":"short description"}]}. The TUI Gallery only displays manifest entries and previews .mmd Mermaid sources; never infer or auto-register existing files.\n` };
+		return {
+			systemPrompt: `${event.systemPrompt}\n\nActive Workspace: ${root.path}\nInterpret relative file paths, project files, and project commands as referring to this workspace by default. Use paths under it for native file tools and run project shell commands from it. An explicit user-provided absolute path overrides this default.\n\nDiagram Gallery contract: Do not create or register diagrams unless the user explicitly asks you to generate a diagram, chart, architecture view, flowchart, or node graph. For such a request, create Mermaid flowchart/graph source under <Active Workspace>/.pi/diagrams/<stable-id>.mmd and create or update <Active Workspace>/.pi/diagrams/gallery.json in this exact shape: {"diagrams":[{"id":"stable-id","title":"Human title","file":"stable-id.mmd","type":"mermaid","createdAt":"ISO-8601 timestamp","summary":"short description"}]}. The TUI Gallery only displays manifest entries and previews .mmd Mermaid sources; never infer or auto-register existing files.\n`,
+		};
 	});
 	const open = async (ctx: ExtensionCommandContext): Promise<void> => {
 		if (ctx.mode !== "tui") return;
 		const current = active(ctx);
-		const result = await ctx.ui.custom<Result>((tui, theme, _keybindings, done) => new WorkspaceDrawer(ctx, current, configuredWorkspaces(ctx.cwd), theme, done, tui, Boolean(translationBridge())), {
-			overlay: true,
-			overlayOptions: { anchor: "right-center", width: 54, maxHeight: "100%", margin: { top: 1, right: 1, bottom: 1 } },
-		});
-		if (result?.type === "workspace") { workspace = result.workspace; pi.appendEntry(STATE_TYPE, workspace); ctx.ui.notify(`Workspace: ${workspace.name}`, "info"); }
-		else if (result?.type === "sessions") await openSessionLibrary(pi, ctx);
-		else if (result?.type === "translation") {
+		const result = await ctx.ui.custom<Result>(
+			(tui, theme, _keybindings, done) => new WorkspaceDrawer(ctx, current, configuredWorkspaces(ctx.cwd), theme, done, tui, Boolean(translationBridge()), hasChoicesBridge()),
+			{ overlay: true, overlayOptions: { anchor: "right-center", width: 54, maxHeight: "100%", margin: { top: 1, right: 1, bottom: 1 } } },
+		);
+		if (!result) return;
+		if (result.type === "workspace") { workspace = result.workspace; pi.appendEntry(STATE_TYPE, workspace); ctx.ui.notify(`Workspace: ${workspace.name}`, "info"); }
+		else if (result.type === "sessions") await openSessionLibrary(pi, ctx);
+		else if (result.type === "search-sessions") await searchAndOpenSession(pi, ctx);
+		else if (result.type === "translation") {
 			const bridge = translationBridge();
 			if (bridge) await bridge.open(ctx);
 			else ctx.ui.notify("Install pi-translation-studio to enable Translation Studio.", "info");
 		}
-		else if (result?.type === "organize-skills") { await organizeSkillFolders(ctx); await open(ctx); }
-		else if (result?.type === "use-skill") { ctx.ui.setEditorText(`/skill:${result.canonicalName} `); ctx.ui.notify("Skill command is ready in the editor. Add details, then submit.", "info"); }
-		else if (result?.type === "toggle-skill-folder") {
+		else if (result.type === "diagram-starter") {
+			ctx.ui.setEditorText(DIAGRAM_STARTER);
+			ctx.ui.notify("Prompt placed in editor — add details and submit when ready.", "info");
+		}
+		else if (result.type === "edit-notes") {
+			const existing = workspaceNotes(result.workspacePath);
+			const next = await ctx.ui.editor("Workspace Notes", existing);
+			if (next !== undefined) {
+				saveWorkspaceNotes(result.workspacePath, next.trim() ? `${next.trim()}\n` : "");
+				ctx.ui.notify(next.trim() ? "Notes saved." : "Notes cleared.", "info");
+			}
+		}
+		else if (result.type === "organize-skills") { await organizeSkillFolders(ctx); await open(ctx); }
+		else if (result.type === "use-skill") {
+			ctx.ui.setEditorText(`/skill:${result.canonicalName} `);
+			ctx.ui.notify("Skill command is ready in the editor. Add details, then submit.", "info");
+		}
+		else if (result.type === "toggle-skill-folder") {
 			const action = result.enabled ? "Disable" : "Enable";
-			const approved = await ctx.ui.confirm(`${action} skill folder?`, `${action} every skill in “${result.relative}”? Nothing is deleted; the complete skill folders move to the other library.`);
-			if (approved) { try { const count = moveSkillFolder(result.enabled, result.relative); ctx.ui.notify(`${action}d ${count} skill${count === 1 ? "" : "s"}. Run /reload to apply discovery changes.`, "info"); } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Could not move skill folder.", "error"); } }
+			const approved = await ctx.ui.confirm(`${action} skill folder?`, `${action} every skill in "${result.relative}"? Nothing is deleted; the complete skill folders move to the other library.`);
+			if (approved) {
+				try { const count = moveSkillFolder(result.enabled, result.relative); ctx.ui.notify(`${action}d ${count} skill${count === 1 ? "" : "s"}. Run /reload to apply discovery changes.`, "info"); }
+				catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Could not move skill folder.", "error"); }
+			}
 			await open(ctx);
 		}
-		else if (result?.type === "edit-label") {
-			const current = labelsFor(result.kind, result.key)[result.field] || "";
-			const next = result.field === "displayName" ? await ctx.ui.input(`Personal ${result.kind === "mcp" ? "MCP" : "skill"} display name`, current || result.fallback) : await ctx.ui.editor(`Personal note for ${result.fallback}`, current);
-			if (next !== undefined) { const data = resourceMetadata(); const collection = data[result.kind] || {}; const labels = { ...collection[result.key], [result.field]: next.trim() }; if (!labels.displayName && !labels.note) delete collection[result.key]; else collection[result.key] = labels; data[result.kind] = collection; saveResourceMetadata(data); ctx.ui.notify("Personal label saved. It is not sent to the model.", "info"); }
+		else if (result.type === "confirm-skill-toggle") {
+			const skill = result.skill;
+			const action = skill.enabled ? "Disable" : "Enable";
+			const approved = await ctx.ui.confirm(`${action} skill?`, `${action} "${skill.name}"? The skill folder moves to the ${skill.enabled ? "disabled" : "active"} library. Nothing is deleted. Run /reload to apply changes.`);
+			if (approved) {
+				try {
+					moveSkill(skill, skill.enabled ? DISABLED_SKILLS_DIR : SKILLS_DIR, skillKey(skill));
+					ctx.ui.notify(`${action}d "${skill.name}". Run /reload to apply discovery changes.`, "info");
+				} catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Could not move skill.", "error"); }
+			}
 		}
-		else if (result?.type === "view-diagram") {
+		else if (result.type === "edit-label") {
+			const existing = labelsFor(result.kind, result.key)[result.field] || "";
+			const next = result.field === "displayName"
+				? await ctx.ui.input(`Personal ${result.kind === "mcp" ? "MCP" : "skill"} display name`, existing || result.fallback)
+				: await ctx.ui.editor(`Personal note for ${result.fallback}`, existing);
+			if (next !== undefined) {
+				const data = resourceMetadata(), collection = data[result.kind] || {};
+				const labels = { ...collection[result.key], [result.field]: next.trim() };
+				if (!labels.displayName && !labels.note) delete collection[result.key]; else collection[result.key] = labels;
+				data[result.kind] = collection;
+				saveResourceMetadata(data);
+				ctx.ui.notify("Personal label saved. It is not sent to the model.", "info");
+			}
+		}
+		else if (result.type === "view-diagram") {
 			const url = await openMermaidViewer(current.path, result.diagram);
 			ctx.ui.notify(url ? `Opened Mermaid Viewer: ${result.diagram.title}` : "This entry does not have a readable registered .mmd Mermaid source.", url ? "info" : "error");
 		}
-
 	};
 	pi.registerCommand("workspace", { description: "Open Terra Workspace Drawer", handler: async (_args, ctx) => await open(ctx) });
 	pi.registerShortcut(Key.alt("w"), { description: "Open Terra Workspace Drawer", handler: async (ctx) => await open(ctx as ExtensionCommandContext) });

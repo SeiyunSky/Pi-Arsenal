@@ -393,7 +393,7 @@ function makeRow(theme: Theme) {
 	return (text: string, selected = false): string => {
 		const pad = " ".repeat(Math.max(0, INNER - visibleWidth(text)));
 		const inner = selected
-			? theme.bg("accent", theme.fg("background", text + pad))
+			? theme.fg("accent", theme.bold(text)) + pad
 			: text + pad;
 		return theme.fg("border", "│") + inner + theme.fg("border", "│");
 	};

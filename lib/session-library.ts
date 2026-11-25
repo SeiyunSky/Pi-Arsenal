@@ -112,7 +112,7 @@ export async function openSessionLibrary(pi: ExtensionAPI, ctx: ExtensionCommand
 	}
 }
 
-async function manageSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, initial: SessionInfo, currentPath: string | undefined): Promise<"back" | "switch"> {
+export async function manageSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, initial: SessionInfo, currentPath: string | undefined): Promise<"back" | "switch"> {
 	let session = initial;
 	while (true) {
 		const current = session.path === currentPath;

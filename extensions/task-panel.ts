@@ -87,17 +87,6 @@ function approvalFromChoices(event: { toolName: string; content: Array<{ type: s
 	}
 }
 
-// Shared mutable state so the /task command can read it.
-let _steps: PlanStep[] = [];
-let _cancelPlan: (() => void) | undefined;
-
-export function getActivePlan(): PlanStep[] { return _steps; }
-export function cancelActivePlan(): boolean {
-	if (!_steps.some((s) => s.status !== "completed")) return false;
-	if (_cancelPlan) _cancelPlan();
-	return true;
-}
-
 export default function taskPanel(pi: ExtensionAPI) {
 	let steps: PlanStep[] = [];
 	let planChangeAuthorized = false;
@@ -124,7 +113,6 @@ export default function taskPanel(pi: ExtensionAPI) {
 
 	function restore(ctx: ExtensionContext): void {
 		steps = restoreSteps(ctx.sessionManager.getBranch());
-		_steps = steps;
 		planChangeAuthorized = false;
 		planChangeChoiceCallId = undefined;
 		render(ctx);
@@ -158,15 +146,10 @@ export default function taskPanel(pi: ExtensionAPI) {
 		const next = parseSteps((event.args as { steps?: unknown } | undefined)?.steps);
 		if (!next) return;
 		steps = next;
-		_steps = steps;
 		render(ctx);
 	});
 
 	// /task command: show current plan and optionally cancel it.
-	_cancelPlan = () => {
-		steps = steps.map((s) => s.status === "completed" ? s : { ...s, status: "completed" as const });
-		_steps = steps;
-	};
 	pi.registerCommand("task", {
 		description: "Show current plan and cancel if needed",
 		handler: async (_args, ctx) => {
@@ -182,7 +165,6 @@ export default function taskPanel(pi: ExtensionAPI) {
 				const confirmed = await ctx.ui.confirm("Cancel plan?", "Mark all remaining steps completed so the model is free to start a new plan.");
 				if (confirmed) {
 					steps = steps.map((s) => ({ ...s, status: "completed" as const }));
-					_steps = steps;
 					render(ctx);
 					ctx.ui.notify("Plan cancelled. The model may now start a new plan.", "info");
 				}

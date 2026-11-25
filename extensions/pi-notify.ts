@@ -2,47 +2,59 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-// ─── Toast via WinRT ──────────────────────────────────────────────────────────
-// Uses Windows.UI.Notifications WinRT API (available on Windows 10/11).
-// Falls back to a simple `msg %USERNAME%` if WinRT fails.
+// ─── Platform dispatch ────────────────────────────────────────────────────────
 
-const APP_ID = "Pi Arsenal";
-
-function escapeXml(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function sendNotification(title: string, body: string, urgency: "info" | "warning" | "error"): Promise<void> {
+	switch (process.platform) {
+		case "win32":  return sendWindows(title, body, urgency);
+		case "darwin": return sendMac(title, body);
+		default:       return sendLinux(title, body, urgency);
+	}
 }
 
-function sendToast(title: string, body: string, urgency: "info" | "warning" | "error"): Promise<void> {
-	const scenario = urgency === "error" ? "urgent" : urgency === "warning" ? "reminder" : "default";
-	// WinRT XML template
-	const xml = `<toast scenario="${scenario}"><visual><binding template="ToastGeneric"><text>${escapeXml(title)}</text><text>${escapeXml(body)}</text></binding></visual></toast>`;
+// ─── Windows — NotifyIcon balloon (System.Windows.Forms) ─────────────────────
+// WinRT ToastNotificationManager requires a registered AppUserModelID;
+// NotifyIcon works without registration and is available on all Windows versions.
+
+function sendWindows(title: string, body: string, _urgency: "info" | "warning" | "error"): Promise<void> {
 	const ps = `
-$xml = '${xml.replace(/'/g, "''")}';
-$dom = New-Object Windows.Data.Xml.Dom.XmlDocument;
-$dom.LoadXml($xml);
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;
-[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime] | Out-Null;
-$toast = [Windows.UI.Notifications.ToastNotification]::new($dom);
-$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${APP_ID.replace(/'/g, "''")}');
-$notifier.Show($toast);
+Add-Type -AssemblyName System.Windows.Forms
+$n = New-Object System.Windows.Forms.NotifyIcon
+$n.Icon = [System.Drawing.SystemIcons]::Information
+$n.Visible = $true
+$n.ShowBalloonTip(6000, '${esc(title)}', '${esc(body)}', [System.Windows.Forms.ToolTipIcon]::Info)
+Start-Sleep -Seconds 4
+$n.Dispose()
 `;
-	return new Promise((resolve) => {
-		const proc = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { stdio: "ignore" });
-		proc.on("close", (code) => {
-			if (code !== 0) sendFallback(title, body).then(resolve);
-			else resolve();
-		});
-		proc.on("error", () => sendFallback(title, body).then(resolve));
-	});
+	return run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps]);
 }
 
-function sendFallback(title: string, body: string): Promise<void> {
-	// msg.exe: works on all Windows versions, shows a dialog to the current user session.
+// ─── macOS — osascript (zero dependencies) ───────────────────────────────────
+
+function sendMac(title: string, body: string): Promise<void> {
+	const script = `display notification "${esc(body)}" with title "${esc(title)}"`;
+	return run("osascript", ["-e", script]);
+}
+
+// ─── Linux — notify-send ─────────────────────────────────────────────────────
+
+function sendLinux(title: string, body: string, urgency: "info" | "warning" | "error"): Promise<void> {
+	const level = urgency === "error" ? "critical" : urgency === "warning" ? "normal" : "low";
+	return run("notify-send", ["-u", level, "-t", "6000", title, body]);
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Escape single quotes for embedding in PS / AppleScript strings. */
+function esc(s: string): string {
+	return s.replace(/'/g, "\\'").replace(/"/g, '\\"');
+}
+
+function run(cmd: string, args: string[]): Promise<void> {
 	return new Promise((resolve) => {
-		const text = `${title}\n\n${body}`;
-		const proc = spawn("msg.exe", ["%USERNAME%", text], { stdio: "ignore" });
+		const proc = spawn(cmd, args, { stdio: "ignore" });
 		proc.on("close", () => resolve());
-		proc.on("error", () => resolve());  // silent fail — notification is best-effort
+		proc.on("error", () => resolve()); // best-effort — never throw
 	});
 }
 
@@ -67,7 +79,7 @@ export default function piNotify(pi: ExtensionAPI) {
 		}),
 		async execute(_id, input, _signal, _onUpdate, _ctx) {
 			const { title, body, urgency } = input as { title: string; body: string; urgency: "info" | "warning" | "error" };
-			await sendToast(title.slice(0, 128), body.slice(0, 256), urgency);
+			await sendNotification(title.slice(0, 128), body.slice(0, 256), urgency);
 			return { content: [{ type: "text" as const, text: `Notification sent: "${title}"` }] };
 		},
 	});

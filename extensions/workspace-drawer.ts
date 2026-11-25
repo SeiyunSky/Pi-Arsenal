@@ -34,8 +34,8 @@ const INNER = DRAWER_WIDTH - 2;
 type Workspace = { name: string; path: string };
 type View =
 	| "home" | "projects" | "browser"
-	| "usage" | "diagrams" | "notes" | "env-check"
-	| "skills" | "skill-list" | "skill-detail"
+	| "usage" | "diagrams" | "notes" | "env-check" | "approval-log"
+	| "skills" | "skill-list" | "skill-detail" | "skill-readme"
 	| "mcp" | "mcp-detail";
 type FileItem = { name: string; directory: boolean };
 type UsageTotals = { input: number; output: number; cacheRead: number };
@@ -60,13 +60,13 @@ type Result =
 	| { type: "workspace"; workspace: Workspace }
 	| { type: "view-diagram"; diagram: Diagram }
 	| { type: "diagram-starter" }
-	| { type: "sessions" | "translation" | "search-sessions" | "approval-log" | "toggle-notes-context" }
+	| { type: "sessions" | "translation" | "search-sessions" }
+	| { type: "notes-action"; action: "edit" | "toggle-context" }
 	| { type: "edit-label"; kind: "skills" | "mcp"; key: string; fallback: string; field: "displayName" | "note" }
 	| { type: "use-skill"; canonicalName: string }
 	| { type: "organize-skills" }
 	| { type: "toggle-skill-folder"; enabled: boolean; relative: string }
-	| { type: "confirm-skill-toggle"; skill: Skill }
-	| { type: "edit-notes"; workspacePath: string };
+	| { type: "confirm-skill-toggle"; skill: Skill };
 
 // ─── Bridges ──────────────────────────────────────────────────────────────────
 
@@ -445,9 +445,12 @@ class WorkspaceDrawer implements Focusable {
 	private skillDirectory = "";
 	private skillEnabled = true;
 	private selectedSkill: Skill | undefined;
+	private skillReadmeLines: string[] = [];   // SKILL.md lines for preview
 	private mcpItems: McpServer[] = [];
 	private selectedMcp: McpServer | undefined;
 	private envItems: EnvItem[] = [];
+	private approvalEntries: ApprovalEntry[] = [];
+	private approvalPage = 0;
 
 	// Cached data loaded at Drawer open (not per-frame)
 	private readonly notesContent: string;
@@ -487,7 +490,7 @@ class WorkspaceDrawer implements Focusable {
 			{ kind: "section", label: "Sessions" },
 			{ kind: "item", label: "🕘 Session Library", result: "sessions" },
 			{ kind: "item", label: "🔎 Search sessions…", result: "search-sessions" },
-			{ kind: "item", label: "🛡  Approval Log", result: "approval-log" },
+			{ kind: "item", label: "🛡  Approval Log", view: "approval-log" },
 			{ kind: "section", label: "Resources" },
 			{ kind: "item", label: "✨ Skill Library", view: "skills" },
 			{ kind: "item", label: "🔌 MCP Servers", view: "mcp" },
@@ -509,6 +512,16 @@ class WorkspaceDrawer implements Focusable {
 		if (view === "skill-list") this.skillEntryItems = skillEntries(this.skillEnabled, this.skillDirectory);
 		if (view === "mcp") this.mcpItems = cachedMcpServers();
 		if (view === "env-check") this.envItems = buildEnvItems(this.ctx, this.hasTranslationStudio, this.hasPiChoices);
+		if (view === "approval-log") {
+			this.approvalEntries = readApprovalLog();
+			this.approvalPage = 0;
+		}
+		if (view === "skill-readme" && this.selectedSkill) {
+			try {
+				const raw = readFileSync(join(this.selectedSkill.path, "SKILL.md"), "utf8");
+				this.skillReadmeLines = raw.split("\n");
+			} catch { this.skillReadmeLines = ["(SKILL.md could not be read)"]; }
+		}
 	}
 
 	private openBrowser(path: string | undefined): void {
@@ -529,6 +542,7 @@ class WorkspaceDrawer implements Focusable {
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) {
 			if (this.view === "home") { this.done({ type: "close" }); return; }
 			if (this.view === "browser") { this.backBrowser(); return; }
+			if (this.view === "skill-readme") { this.open("skill-detail"); return; }
 			if (this.view === "skill-list") {
 				if (this.skillDirectory) {
 					this.skillDirectory = dirname(this.skillDirectory);
@@ -552,10 +566,15 @@ class WorkspaceDrawer implements Focusable {
 		if (matchesKey(data, "s") && this.view === "browser" && this.browserPath) {
 			this.done({ type: "workspace", workspace: { name: basename(this.browserPath) || this.browserPath, path: this.browserPath } }); return;
 		}
-		// C = toggle notes context, only inside notes view
-		if (matchesKey(data, "c") && this.view === "notes") {
-			this.done({ type: "toggle-notes-context" }); return;
+		// approval-log: [ / ] to page
+		if (this.view === "approval-log") {
+			const pageSize = 12;
+			const maxPage = Math.max(0, Math.ceil(this.approvalEntries.length / pageSize) - 1);
+			if ((matchesKey(data, Key.right) || matchesKey(data, "]")) && this.approvalPage < maxPage) { this.approvalPage++; return; }
+			if ((matchesKey(data, Key.left) || matchesKey(data, "[")) && this.approvalPage > 0) { this.approvalPage--; return; }
 		}
+		// skill-readme: Esc / ← back to detail
+		if (this.view === "skill-readme") { this.open("skill-detail"); return; }
 
 		if (matchesKey(data, Key.up) || matchesKey(data, "k")) { this.moveSelection(-1); return; }
 		if (matchesKey(data, Key.down) || matchesKey(data, "j")) { this.moveSelection(1); return; }
@@ -582,16 +601,24 @@ class WorkspaceDrawer implements Focusable {
 			case "diagrams": return Math.max(0, (this.diagramItems.length > 0 ? this.diagramItems.length - 1 : 0));
 			case "skills": return 1;
 			case "skill-list": return this.skillEntryItems.length + (this.skillDirectory ? 1 : 0);
-			case "skill-detail": return this.selectedSkill?.enabled ? 3 : 2;
+			case "skill-detail": return this.selectedSkill?.enabled ? 4 : 3;
 			case "mcp": return Math.max(0, this.mcpItems.length - 1);
-			case "mcp-detail": return Math.max(0, (this.selectedMcp?.tools.length || 1) - 1);
+			case "mcp-detail": return 0;  // tools are non-interactive; N/O via letter keys
+			case "notes": return 1;  // 0 = edit, 1 = toggle context
+			case "approval-log": return 1;  // prev/next page arrows
 			default: return 0;
 		}
 	}
 
 	private activate(): void {
-		if (this.view === "notes") { this.done({ type: "edit-notes", workspacePath: this.workspace.path }); return; }
-		if (this.view === "mcp-detail" || this.view === "usage" || this.view === "env-check") return;
+		if (this.view === "mcp-detail" || this.view === "usage" || this.view === "env-check" || this.view === "approval-log" || this.view === "skill-readme") return;
+
+		// Notes: two explicit actions instead of direct-to-editor
+		if (this.view === "notes") {
+			if (this.selected === 0) this.done({ type: "notes-action", action: "edit" });
+			else this.done({ type: "notes-action", action: "toggle-context" });
+			return;
+		}
 
 		if (this.view === "diagrams") {
 			if (!this.diagramItems.length && this.selected === 0) { this.done({ type: "diagram-starter" }); return; }
@@ -615,9 +642,10 @@ class WorkspaceDrawer implements Focusable {
 		if (this.view === "skill-detail") {
 			if (!this.selectedSkill) return;
 			const off = this.selectedSkill.enabled ? 1 : 0;
-			if (this.selectedSkill.enabled && this.selected === 0) this.done({ type: "use-skill", canonicalName: this.selectedSkill.name });
-			else if (this.selected === off) this.done({ type: "edit-label", kind: "skills", key: skillKey(this.selectedSkill), fallback: this.selectedSkill.name, field: "displayName" });
-			else if (this.selected === off + 1) this.done({ type: "edit-label", kind: "skills", key: skillKey(this.selectedSkill), fallback: this.selectedSkill.name, field: "note" });
+			if (this.selected === 0) this.open("skill-readme");  // first action is always "Read SKILL.md"
+			else if (this.selectedSkill.enabled && this.selected === 1) this.done({ type: "use-skill", canonicalName: this.selectedSkill.name });
+			else if (this.selected === off + 1) this.done({ type: "edit-label", kind: "skills", key: skillKey(this.selectedSkill), fallback: this.selectedSkill.name, field: "displayName" });
+			else if (this.selected === off + 2) this.done({ type: "edit-label", kind: "skills", key: skillKey(this.selectedSkill), fallback: this.selectedSkill.name, field: "note" });
 			else this.done({ type: "confirm-skill-toggle", skill: this.selectedSkill });
 			return;
 		}
@@ -649,10 +677,12 @@ class WorkspaceDrawer implements Focusable {
 			skills: "Skill Library",
 			"skill-list": this.skillEnabled ? "Enabled Skills" : "Disabled Skills",
 			"skill-detail": "Skill Details",
+			"skill-readme": "SKILL.md",
 			mcp: "MCP Servers",
 			"mcp-detail": "MCP Details",
 			notes: "Workspace Notes",
 			"env-check": "Environment",
+			"approval-log": "Approval Log",
 		};
 
 		const title = viewTitle[this.view];
@@ -767,15 +797,18 @@ class WorkspaceDrawer implements Focusable {
 			lines.push(row(` ${th.fg("muted", this.workspace.name)}  ${inCtx ? th.fg("success", "→ included in context") : th.fg("dim", "not in context")}`));
 			lines.push(row(""));
 			if (this.notesContent.trim()) {
-				for (const line of this.notesContent.split("\n").slice(0, 18)) lines.push(row(` ${th.fg("text", line)}`));
-				const extra = this.notesContent.split("\n").length - 18;
+				for (const line of this.notesContent.split("\n").slice(0, 14)) lines.push(row(` ${th.fg("text", line)}`));
+				const extra = this.notesContent.split("\n").length - 14;
 				if (extra > 0) lines.push(row(th.fg("dim", ` … ${extra} more lines`)));
 			} else {
 				lines.push(row(th.fg("dim", " No notes yet.")));
 				lines.push(row(th.fg("dim", " Personal reminders — not sent to model by default.")));
 			}
 			lines.push(row(""));
-			lines.push(row(th.fg("dim", "Enter edit · C toggle context · Esc / ←  back")));
+			lines.push(row(` ${th.fg("text", "✏️  Edit notes")}`, sel(0)));
+			lines.push(row(` ${th.fg(inCtx ? "success" : "muted", inCtx ? "■  Remove from context" : "□  Include in context")}`, sel(1)));
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "↑ ↓  Enter confirm · Esc / ←  back")));
 
 		// ── Environment Check ─────────────────────────────────────────────────
 		} else if (this.view === "env-check") {
@@ -839,8 +872,8 @@ class WorkspaceDrawer implements Focusable {
 				lines.push(row(`  ${th.fg("dim", s.description)}`));
 				lines.push(row(""));
 				const actions = s.enabled
-					? ["Use this skill now", "Edit display name", "Edit personal note", "Disable this skill"]
-					: ["Edit display name", "Edit personal note", "Enable this skill"];
+					? ["Read SKILL.md", "Use this skill now", "Edit display name", "Edit personal note", "Disable this skill"]
+					: ["Read SKILL.md", "Edit display name", "Edit personal note", "Enable this skill"];
 				for (const [i, action] of actions.entries()) lines.push(row(` ${th.fg(sel(i) ? "accent" : "text", action)}`, sel(i)));
 			}
 			lines.push(row(""));
@@ -887,6 +920,62 @@ class WorkspaceDrawer implements Focusable {
 				lines.push(row(""));
 				lines.push(row(th.fg("dim", "N display name · O note · Esc / ←  back")));
 			}
+
+		// ── Skill README ─────────────────────────────────────────────────────
+		} else if (this.view === "skill-readme") {
+			const name = this.selectedSkill ? displayName("skills", skillKey(this.selectedSkill), this.selectedSkill.name) : "";
+			lines.push(row(` ${th.fg("muted", name)}`));
+			lines.push(row(""));
+			const maxLines = 24;
+			const readmeLines = this.skillReadmeLines;
+			const start = Math.floor(this.selected / maxLines) * maxLines;
+			for (let i = start; i < Math.min(start + maxLines, readmeLines.length); i++) {
+				// Strip markdown formatting for clean display
+				const raw = readmeLines[i]!.replace(/^#{1,6}\s+/, "").replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1");
+				const isHeader = /^#{1,6}\s/.test(readmeLines[i]!);
+				lines.push(row(` ${isHeader ? th.fg("accent", raw) : th.fg("text", raw)}`));
+			}
+			if (readmeLines.length > maxLines) {
+				const page = Math.floor(start / maxLines) + 1;
+				const total = Math.ceil(readmeLines.length / maxLines);
+				lines.push(row(th.fg("dim", ` Page ${page} / ${total}`)));
+			}
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "↑ ↓  scroll · Esc / ←  back to detail")));
+
+		// ── Approval Log ─────────────────────────────────────────────────────
+		} else if (this.view === "approval-log") {
+			const entries = this.approvalEntries;
+			const pageSize = 12;
+			const today = new Date().toDateString();
+			const todayCount = entries.filter((e) => new Date(e.timestamp).toDateString() === today).length;
+			lines.push(row(` ${th.fg("muted", `${entries.length} total entries${todayCount ? ` · ${todayCount} today` : ""}`)}`));
+			lines.push(row(""));
+			if (!entries.length) {
+				lines.push(row(th.fg("dim", " No approval events yet.")));
+				lines.push(row(th.fg("dim", " Events are recorded when pi-op-approval intercepts a tool call.")));
+			} else {
+				const start = this.approvalPage * pageSize;
+				for (let i = start; i < Math.min(start + pageSize, entries.length); i++) {
+					const e = entries[i]!;
+					const time = new Date(e.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+					const isToday = new Date(e.timestamp).toDateString() === today;
+					const verdict = e.approved && e.approval !== "deny";
+					const verdictStr = verdict ? "allow" : "deny ";
+					const verdictColor = verdict ? "success" : "error";
+					const timeStr = isToday ? th.fg("text", time) : th.fg("dim", time);
+					lines.push(row(` ${timeStr}  ${th.fg(verdictColor, verdictStr)}  ${th.fg("text", e.operation)}  ${th.fg("dim", `(${e.tool})`)}`));
+				}
+				const totalPages = Math.ceil(entries.length / pageSize);
+				if (totalPages > 1) {
+					lines.push(row(""));
+					const prev = this.approvalPage > 0 ? th.fg("accent", "[ prev") : th.fg("dim", "[ prev");
+					const next = this.approvalPage < totalPages - 1 ? th.fg("accent", "next ]") : th.fg("dim", "next ]");
+					lines.push(row(` ${prev}  Page ${this.approvalPage + 1} / ${totalPages}  ${next}`));
+				}
+			}
+			lines.push(row(""));
+			lines.push(row(th.fg("dim", "[ / ]  page · Esc / ←  back")));
 		}
 
 		lines.push(th.fg("borderAccent", `╰${"─".repeat(INNER)}╯`));
@@ -952,35 +1041,19 @@ export default function workspaceDrawer(pi: ExtensionAPI) {
 				ctx.ui.notify("Prompt placed in editor — add details and submit when ready.", "info");
 				break;
 
-			case "edit-notes": {
-				const existing = workspaceNotes(result.workspacePath);
-				const next = await ctx.ui.editor("Workspace Notes", existing);
-				if (next !== undefined) {
-					saveWorkspaceNotes(result.workspacePath, next.trim() ? `${next.trim()}\n` : "");
-					ctx.ui.notify(next.trim() ? "Notes saved." : "Notes cleared.", "info");
+			case "notes-action": {
+				if (result.action === "edit") {
+					const existing = workspaceNotes(current.path);
+					const next = await ctx.ui.editor("Workspace Notes", existing);
+					if (next !== undefined) {
+						saveWorkspaceNotes(current.path, next.trim() ? `${next.trim()}\n` : "");
+						ctx.ui.notify(next.trim() ? "Notes saved." : "Notes cleared.", "info");
+					}
+				} else {
+					const enabled = notesContextEnabled(current.path);
+					saveNotesContext(current.path, !enabled);
+					ctx.ui.notify(!enabled ? "📌 Notes will be included in context from the next message." : "Notes removed from context.", "info");
 				}
-				break;
-			}
-
-			case "toggle-notes-context": {
-				const enabled = notesContextEnabled(current.path);
-				saveNotesContext(current.path, !enabled);
-				ctx.ui.notify(!enabled ? "📌 Notes will be included in context from the next message." : "Notes removed from context.", "info");
-				break;
-			}
-
-			case "approval-log": {
-				const entries = readApprovalLog();
-				if (!entries.length) { ctx.ui.notify("No approval log entries yet.", "info"); break; }
-				const today = new Date().toDateString();
-				const show = entries.filter((e) => new Date(e.timestamp).toDateString() === today);
-				const list = (show.length ? show : entries.slice(0, 30)).map((e) => {
-					const time = new Date(e.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-					const verdict = e.approved ? (e.approval === "deny" ? "deny" : "allow") : "deny";
-					return `${time}  ${verdict.padEnd(5)}  ${e.operation}  (${e.tool})`;
-				});
-				const header = show.length ? `Today · ${show.length} entries` : `Recent · ${list.length} entries`;
-				await ctx.ui.editor(header, list.join("\n"));
 				break;
 			}
 
@@ -1019,7 +1092,8 @@ export default function workspaceDrawer(pi: ExtensionAPI) {
 			}
 
 			case "edit-label": {
-				const existing = (this.resourceMeta?.[result.kind] ?? {})[result.key]?.[result.field] ?? "";
+				const meta = resourceMetadata();
+				const existing = (meta[result.kind] ?? {})[result.key]?.[result.field] ?? "";
 				const next = result.field === "displayName"
 					? await ctx.ui.input(`${result.kind === "mcp" ? "MCP" : "Skill"} display name`, (existing as string) || result.fallback)
 					: await ctx.ui.editor(`Note for ${result.fallback}`, existing as string);

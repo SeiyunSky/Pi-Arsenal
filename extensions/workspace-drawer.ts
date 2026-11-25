@@ -48,7 +48,7 @@ type Result =
 	| { type: "workspace"; workspace: Workspace }
 	| { type: "view-diagram"; diagram: Diagram }
 	| { type: "diagram-starter" }
-	| { type: "sessions" | "translation" | "search-sessions" | "clean-sessions" | "approval-log" | "toggle-notes-context" }
+	| { type: "sessions" | "translation" | "search-sessions" | "approval-log" | "toggle-notes-context" }
 	| { type: "edit-label"; kind: "skills" | "mcp"; key: string; fallback: string; field: "displayName" | "note" }
 	| { type: "use-skill"; canonicalName: string }
 	| { type: "organize-skills" }
@@ -392,7 +392,6 @@ class WorkspaceDrawer implements Focusable {
 			{ label: "🗺️  Diagram Gallery", view: "diagrams" },
 			{ label: "🕘 Session Library", result: "sessions" },
 			{ label: "🔎 Search sessions…", result: "search-sessions" },
-			{ label: "🧹 Clean up sessions…", result: "clean-sessions" },
 			...(this.hasTranslationStudio ? [{ label: "🌐 Translation Studio", result: "translation" as const }] : []),
 			{ label: `📌 Workspace Notes${hasNotes ? " ·" : ""}`, view: "notes" as View },
 			{ label: `${notesInCtx ? "📌" : "○"} Include notes in context`, result: "toggle-notes-context" as Result["type"] },
@@ -774,29 +773,6 @@ export default function workspaceDrawer(pi: ExtensionAPI) {
 				saveWorkspaceNotes(result.workspacePath, next.trim() ? `${next.trim()}\n` : "");
 				ctx.ui.notify(next.trim() ? "Notes saved." : "Notes cleared.", "info");
 			}
-		}
-		else if (result.type === "clean-sessions") {
-			const currentPath = ctx.sessionManager.getSessionFile();
-			const all = await listSessions();
-			const nonCurrent = all.filter((s) => s.path !== currentPath);
-			if (!nonCurrent.length) { ctx.ui.notify("No other sessions to clean up.", "info"); return; }
-			const strategy = await ctx.ui.select(
-				`Clean up sessions (${nonCurrent.length} available, current is protected)`,
-				["Keep newest 10, delete the rest", "Keep newest 20, delete the rest", "Delete sessions older than 7 days", "Delete sessions older than 30 days", "Cancel"],
-			);
-			if (!strategy || strategy === "Cancel") return;
-			const now = Date.now();
-			const toDelete = strategy.startsWith("Keep newest")
-				? nonCurrent.slice(Number(strategy.includes("10") ? 10 : 20))
-				: nonCurrent.filter((s) => (now - s.modified.getTime()) > (strategy.includes("7") ? 7 : 30) * 86400000);
-			if (!toDelete.length) { ctx.ui.notify("No sessions match the criteria.", "info"); return; }
-			const preview = toDelete.slice(0, 5).map((s) => `• ${sessionTitle(s)} (${relativeTime(s.modified)})`).join("\n");
-			const more = toDelete.length > 5 ? `\n… and ${toDelete.length - 5} more` : "";
-			const confirmed = await ctx.ui.confirm(`Delete ${toDelete.length} session${toDelete.length === 1 ? "" : "s"}?`, `${preview}${more}\n\nThis cannot be undone.`);
-			if (!confirmed) return;
-			let deleted = 0;
-			for (const s of toDelete) { try { const { rmSync } = await import("node:fs"); rmSync(s.path); deleted++; } catch { /* Skip undeletable sessions. */ } }
-			ctx.ui.notify(`Deleted ${deleted} session${deleted === 1 ? "" : "s"}.`, "info");
 		}
 		else if (result.type === "toggle-notes-context") {
 			const enabled = notesContextEnabled(current.path);

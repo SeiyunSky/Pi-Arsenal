@@ -87,6 +87,9 @@ function approvalFromChoices(event: { toolName: string; content: Array<{ type: s
 	}
 }
 
+const TASK_BRIDGE_KEY = Symbol.for("pi-arsenal.task-panel.bridge.v1");
+type TaskBridge = { getSteps(): PlanStep[]; cancelPlan(): void };
+
 export default function taskPanel(pi: ExtensionAPI) {
 	let steps: PlanStep[] = [];
 	let planChangeAuthorized = false;
@@ -120,6 +123,15 @@ export default function taskPanel(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
+
+	// Publish bridge so task-overlay can read steps without import coupling.
+	const bridge: TaskBridge = {
+		getSteps: () => steps,
+		cancelPlan: () => {
+			steps = steps.map((s) => ({ ...s, status: "completed" as const }));
+		},
+	};
+	(globalThis as Record<symbol, unknown>)[TASK_BRIDGE_KEY] = bridge;
 	pi.on("before_agent_start", async (event) => {
 		if (!isActivePlan(steps)) return;
 		event.systemPromptOptions.customInstructions = [event.systemPromptOptions.customInstructions, TASK_DISCIPLINE].filter(Boolean).join("\n\n");
